@@ -1,0 +1,16 @@
+[project]
+name = "quantisation-benchmarking"
+version = "0.1.0"
+description = "Dequantisation kernel benchmarks"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "triton",
+    "pandas",
+    "ipykernel",
+    "matplotlib",
+    "seaborn",
+]
+
+[tool.setuptools]
+packages = []
