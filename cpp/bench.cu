@@ -298,7 +298,7 @@ void test_lut() {
                                          -10.0f, 0.0f, 10.0f, 20.0f, 30.0f, 40.0f, 50.0f, 60.0f,
                                          70.0f});
     // Double up the data - once to fill an uint4, more for threads & loops
-    for (auto i = 0; i < 4; i++) {
+    for (auto i = 0; i < 5; i++) {
         d_in.insert(d_in.end(), d_in.begin(), d_in.end());
         expected.insert(expected.end(), expected.begin(), expected.end());
     }
@@ -309,7 +309,7 @@ void test_lut() {
     {
         thrust::device_vector<__nv_bfloat16> d_out(expected.size());
         d_out.back() = __float2bfloat16(sentinel);
-        kernel__copy_lut4<<<2, 2>>>(reinterpret_cast<const uint4*>(d_in.data().get()),
+        kernel__copy_lut4<<<3, 2>>>(reinterpret_cast<const uint4*>(d_in.data().get()),
                                     d_lut4.data().get(), d_out.data().get(), d_in.size() / 16);
         CHECK_CUDA(cudaGetLastError());
         thrust::host_vector<__nv_bfloat16> h_out = d_out;
@@ -329,7 +329,7 @@ void test_lut() {
 
         thrust::device_vector<__nv_bfloat16> d_out(expected.size());
         d_out.back() = __float2bfloat16(sentinel);
-        kernel__copy_lut8<<<2, 2>>>(
+        kernel__copy_lut8<<<3, 2>>>(
             reinterpret_cast<const uint4*>(d_in.data().get()), d_lut8.data().get(),
             reinterpret_cast<__nv_bfloat162*>(d_out.data().get()), d_in.size() / 16);
         CHECK_CUDA(cudaGetLastError());
@@ -347,7 +347,7 @@ void test_linear4_fp16() {
     // Order defined by the shuffle in dequant_linear4_fp16
     thrust::host_vector<float> expected({-7, -3, -8, -4, -5, -1, -6, -2, 1, 5, 0, 4, 3, 7, 2, 6});
     // Double up the data - once to fill an uint4, more for threads & loops
-    for (auto i = 0; i < 4; i++) {
+    for (auto i = 0; i < 5; i++) {
         d_in.insert(d_in.end(), d_in.begin(), d_in.end());
         expected.insert(expected.end(), expected.begin(), expected.end());
     }
@@ -357,7 +357,7 @@ void test_linear4_fp16() {
     // Test
     thrust::device_vector<half> d_out(expected.size());
     d_out.back() = __float2half(sentinel);
-    kernel__copy_linear4_fp16<<<2, 2>>>(reinterpret_cast<const uint4*>(d_in.data().get()),
+    kernel__copy_linear4_fp16<<<3, 2>>>(reinterpret_cast<const uint4*>(d_in.data().get()),
                                         d_out.data().get(), d_in.size() / 16);
     CHECK_CUDA(cudaGetLastError());
     thrust::host_vector<half> h_out = d_out;
