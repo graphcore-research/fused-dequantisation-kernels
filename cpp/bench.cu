@@ -28,10 +28,8 @@
 // Utilities
 
 constexpr int warp_size = 32;
-
 using bfloat16 = __nv_bfloat16;
 using bfloat162 = __nv_bfloat162;
-
 struct half8 {
     half2 data[4];
 };
@@ -344,7 +342,8 @@ __global__ void kernel__mv(const bfloat16* a,  // [k]
                            bfloat16* out,      // [n]
                            int k,
                            int n) {
-    extern __shared__ float2 shared[];
+    extern __shared__ char _shared[];
+    auto shared = reinterpret_cast<float2*>(_shared);
     const auto in2 = blockIdx.x * blockDim.x + threadIdx.x;
     const auto a2 = reinterpret_cast<const bfloat162*>(a);
     const auto b2 = reinterpret_cast<const bfloat162*>(b);
@@ -388,12 +387,11 @@ void run_mv(const bfloat16* a, const bfloat16* b, bfloat16* out, int k, int n) {
     CHECK_CUDA(cudaGetLastError());
 }
 
-__device__ float2 block_reduce(float2 value) {
-    extern __shared__ float2 shared[];
+template <class T>
+__device__ T block_reduce(T value, T* shared) {
     // Reduce within a warp using shuffle
     for (int offset = warp_size / 2; offset > 0; offset /= 2) {
-        value.x += __shfl_down_sync(0xffffffff, value.x, offset);
-        value.y += __shfl_down_sync(0xffffffff, value.y, offset);
+        value += __shfl_down_sync(0xffffffff, value, offset);
     }
     // Reduce across warps in shared memory
     if ((threadIdx.x % warp_size) == 0) {
@@ -403,8 +401,7 @@ __device__ float2 block_reduce(float2 value) {
     if (threadIdx.x == 0) {
         // A linear reduction is fine - this isn't the bottleneck
         for (auto i = 1u; i < blockDim.x / warp_size; ++i) {
-            value.x += shared[i].x;
-            value.y += shared[i].y;
+            value += shared[i];
         }
     }
     return value;
@@ -415,39 +412,31 @@ __global__ void kernel__mvT(const bfloat16* a,  // [k]
                             bfloat16* out,      // [n]
                             int k,
                             int n) {
-    extern __shared__ float2 shared[];
-    const auto in2 = blockIdx.x;
+    extern __shared__ char _shared[];
     const auto a2 = reinterpret_cast<const bfloat162*>(a);
     const auto b2 = reinterpret_cast<const bfloat162*>(b);
-    const auto out2 = reinterpret_cast<bfloat162*>(out);
-    if (in2 < n / 2) {
-        // Partial dot product for outputs n = [2*in2, 2*in2+1]
-        // with partial sums spread across threadIdx.x
-        float2 sum = {0.0f, 0.0f};
-        for (auto ik2 = threadIdx.x; ik2 < k / 2; ik2 += blockDim.x) {
-            auto a_ik = __bfloat1622float2(a2[ik2]);
-            auto b_in0 = __bfloat1622float2(b2[(2 * in2) * k / 2 + ik2]);
-            auto b_in1 = __bfloat1622float2(b2[(2 * in2 + 1) * k / 2 + ik2]);
-            sum.x = fmaf(a_ik.x, b_in0.x, sum.x);  // n = 2*in2, k = 2*ik2
-            sum.x = fmaf(a_ik.y, b_in0.y, sum.x);  // n = 2*in2, k = 2*ik2+1
-            sum.y = fmaf(a_ik.x, b_in1.x, sum.y);  // n = 2*in2+1, k = 2*ik2
-            sum.y = fmaf(a_ik.y, b_in1.y, sum.y);  // n = 2*in2+1, k = 2*ik2+1
-        }
-        sum = block_reduce(sum);
-        if (threadIdx.x == 0) {
-            out2[in2] = __float22bfloat162_rn(sum);
-        }
+    const auto in = blockIdx.x;
+    // Partial dot product with sums spread across threadIdx.x
+    float sum = 0.0f;
+    for (auto ik2 = threadIdx.x; ik2 < k / 2; ik2 += blockDim.x) {
+        auto a_ik = __bfloat1622float2(a2[ik2]);
+        auto b_in = __bfloat1622float2(b2[in * k / 2 + ik2]);
+        sum = fmaf(a_ik.x, b_in.x, sum);  // n = in, k = 2*ik2
+        sum = fmaf(a_ik.y, b_in.y, sum);  // n = in, k = 2*ik2+1
+    }
+    sum = block_reduce(sum, reinterpret_cast<float*>(_shared));
+    if (threadIdx.x == 0) {
+        out[in] = __float2bfloat16_rn(sum);
     }
 }
 
 void run_mvT(const bfloat16* a, const bfloat16* b, bfloat16* out, int k, int n) {
-    if (n % 2 != 0 || k % 2 != 0) {
-        throw std::invalid_argument("kernel__mv requires n and k to be even");
+    if (k % 2 != 0) {
+        throw std::invalid_argument("kernel__mvT requires k to be even");
     }
-    dim3 blockDim(1024);
-    dim3 gridDim(n / 2);
-    auto sharedBytes = (blockDim.x / warp_size) * sizeof(float2);
-    kernel__mvT<<<gridDim, blockDim, sharedBytes>>>(a, b, out, k, n);
+    auto blockSize = 512;
+    auto sharedBytes = (blockSize / warp_size) * sizeof(float);
+    kernel__mvT<<<n, blockSize, sharedBytes>>>(a, b, out, k, n);
     CHECK_CUDA(cudaGetLastError());
 }
 
