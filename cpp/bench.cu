@@ -27,6 +27,8 @@
 // --------------------------
 // Utilities
 
+constexpr int warp_size = 32;
+
 using bfloat16 = __nv_bfloat16;
 using bfloat162 = __nv_bfloat162;
 
@@ -53,11 +55,6 @@ __device__ inline uint lop3(uint a, uint b, uint c) {
 constexpr uint LOP_A = 0xf0;
 constexpr uint LOP_B = 0xcc;
 constexpr uint LOP_C = 0xaa;
-
-// __device__ inline bfloat16 ldg(const bfloat16* ptr) {
-//     return __ldg(reinterpret_cast<const uint16_t*>(ptr));
-// }
-// reinterpret<bfloat162>(__ldg(&lut_u[idx & 0xFF]));
 
 void check_cuda_error(const std::string& lib, int status, const std::string& file, int line) {
     if (status) {
@@ -391,6 +388,69 @@ void run_mv(const bfloat16* a, const bfloat16* b, bfloat16* out, int k, int n) {
     CHECK_CUDA(cudaGetLastError());
 }
 
+__device__ float2 block_reduce(float2 value) {
+    extern __shared__ float2 shared[];
+    // Reduce within a warp using shuffle
+    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+        value.x += __shfl_down_sync(0xffffffff, value.x, offset);
+        value.y += __shfl_down_sync(0xffffffff, value.y, offset);
+    }
+    // Reduce across warps in shared memory
+    if ((threadIdx.x % warp_size) == 0) {
+        shared[threadIdx.x / warp_size] = value;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        // A linear reduction is fine - this isn't the bottleneck
+        for (auto i = 1u; i < blockDim.x / warp_size; ++i) {
+            value.x += shared[i].x;
+            value.y += shared[i].y;
+        }
+    }
+    return value;
+}
+
+__global__ void kernel__mvT(const bfloat16* a,  // [k]
+                            const bfloat16* b,  // [n, k] (n-major)
+                            bfloat16* out,      // [n]
+                            int k,
+                            int n) {
+    extern __shared__ float2 shared[];
+    const auto in2 = blockIdx.x;
+    const auto a2 = reinterpret_cast<const bfloat162*>(a);
+    const auto b2 = reinterpret_cast<const bfloat162*>(b);
+    const auto out2 = reinterpret_cast<bfloat162*>(out);
+    if (in2 < n / 2) {
+        // Partial dot product for outputs n = [2*in2, 2*in2+1]
+        // with partial sums spread across threadIdx.x
+        float2 sum = {0.0f, 0.0f};
+        for (auto ik2 = threadIdx.x; ik2 < k / 2; ik2 += blockDim.x) {
+            auto a_ik = __bfloat1622float2(a2[ik2]);
+            auto b_in0 = __bfloat1622float2(b2[(2 * in2) * k / 2 + ik2]);
+            auto b_in1 = __bfloat1622float2(b2[(2 * in2 + 1) * k / 2 + ik2]);
+            sum.x = fmaf(a_ik.x, b_in0.x, sum.x);  // n = 2*in2, k = 2*ik2
+            sum.x = fmaf(a_ik.y, b_in0.y, sum.x);  // n = 2*in2, k = 2*ik2+1
+            sum.y = fmaf(a_ik.x, b_in1.x, sum.y);  // n = 2*in2+1, k = 2*ik2
+            sum.y = fmaf(a_ik.y, b_in1.y, sum.y);  // n = 2*in2+1, k = 2*ik2+1
+        }
+        sum = block_reduce(sum);
+        if (threadIdx.x == 0) {
+            out2[in2] = __float22bfloat162_rn(sum);
+        }
+    }
+}
+
+void run_mvT(const bfloat16* a, const bfloat16* b, bfloat16* out, int k, int n) {
+    if (n % 2 != 0 || k % 2 != 0) {
+        throw std::invalid_argument("kernel__mv requires n and k to be even");
+    }
+    dim3 blockDim(1024);
+    dim3 gridDim(n / 2);
+    auto sharedBytes = (blockDim.x / warp_size) * sizeof(float2);
+    kernel__mvT<<<gridDim, blockDim, sharedBytes>>>(a, b, out, k, n);
+    CHECK_CUDA(cudaGetLastError());
+}
+
 // --------------------------
 // Testing
 
@@ -557,8 +617,8 @@ void test_binary() {
 }
 
 void test_mv() {
-    const int k = 180;
-    const int n = 250;
+    const int k = 2300;
+    const int n = 180;
     thrust::host_vector<bfloat16> h_a(k);
     thrust::host_vector<bfloat16> h_b(k * n);
     std::default_random_engine rng(1234);
@@ -570,23 +630,41 @@ void test_mv() {
         h_b[i] = __float2bfloat16(dist(rng));
     }
     thrust::host_vector<bfloat16> expected(n);
+    thrust::host_vector<bfloat16> expectedT(n);
     for (int j = 0; j < n; j++) {
-        float sum = 0.0f;
+        float sum = 0.0f, sumT = 0.0f;
         for (int i = 0; i < k; i++) {
             sum += __bfloat162float(h_a[i]) * __bfloat162float(h_b[i * n + j]);
+            sumT += __bfloat162float(h_a[i]) * __bfloat162float(h_b[j * k + i]);
         }
         expected[j] = __float2bfloat16(sum);
+        expectedT[j] = __float2bfloat16(sumT);
     }
 
-    thrust::device_vector<bfloat16> d_a = h_a;
-    thrust::device_vector<bfloat16> d_b = h_b;
-    thrust::device_vector<bfloat16> d_out(n);
-    run_mv(d_a.data().get(), d_b.data().get(), d_out.data().get(), k, n);
-    thrust::host_vector<bfloat16> h_out = d_out;
+    {
+        thrust::device_vector<bfloat16> d_a = h_a;
+        thrust::device_vector<bfloat16> d_b = h_b;
+        thrust::device_vector<bfloat16> d_out(n);
+        run_mv(d_a.data().get(), d_b.data().get(), d_out.data().get(), k, n);
+        thrust::host_vector<bfloat16> h_out = d_out;
 
-    for (int i = 0; i < n; i++) {
-        expect_eq(__bfloat162float(expected[i]), __bfloat162float(h_out[i]),
-                  "mv output at index " + std::to_string(i), 1e-3f);
+        for (int i = 0; i < n; i++) {
+            expect_eq(__bfloat162float(expected[i]), __bfloat162float(h_out[i]),
+                      "mv output at index " + std::to_string(i), 1e-3f);
+        }
+    }
+
+    {
+        thrust::device_vector<bfloat16> d_a = h_a;
+        thrust::device_vector<bfloat16> d_b = h_b;
+        thrust::device_vector<bfloat16> d_out(n);
+        run_mvT(d_a.data().get(), d_b.data().get(), d_out.data().get(), k, n);
+        thrust::host_vector<bfloat16> h_out = d_out;
+
+        for (int i = 0; i < n; i++) {
+            expect_eq(__bfloat162float(expectedT[i]), __bfloat162float(h_out[i]),
+                      "mvT output at index " + std::to_string(i), 1e-3f);
+        }
     }
 }
 
@@ -862,6 +940,18 @@ void benchmark_mv(Log& log) {
         });
     }
 
+    // mvT
+    {
+        thrust::device_vector<bfloat16> d_a(copies * k, 1.5f);
+        thrust::device_vector<bfloat16> d_b(copies * n * k, 0.125f);
+        thrust::device_vector<bfloat16> d_out(copies * n);
+        run_benchmark("mvT", (k + n * k) * sizeof(bfloat16), n * sizeof(bfloat16), [&](uint i) {
+            auto idx = i % copies;
+            run_mvT(d_a.data().get() + idx * k, d_b.data().get() + idx * n * k,
+                    d_out.data().get() + idx * n, k, n);
+        });
+    }
+
     std::cerr << std::endl;
 }
 
@@ -876,10 +966,19 @@ int main() {
     std::cerr << std::endl;
 
     // Tests
-    test_lut();
-    test_linear4_fp16();
-    test_binary();
-    test_mv();
+    bool test_passed = true;
+    for (auto& test : {test_lut, test_linear4_fp16, test_binary, test_mv}) {
+        try {
+            test();
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << std::endl;
+            test_passed = false;
+            continue;
+        }
+    }
+    if (!test_passed) {
+        std::cerr << "!!! TESTS FAILED !!!\n" << std::endl;
+    }
 
     // Benchmarking
     Log log({{"device", device_name}, {"cuda_version", cuda_version}});
