@@ -2,6 +2,7 @@ nvcc = nvcc
 arch = sm_89
 cflags = -O3 -std=c++17 -arch=$arch $
   -Xcompiler '-Wall -Wextra -Werror -fdiagnostics-color=always'
+libs = -lcublasLt
 
 rule compile
   command = $nvcc $cflags -MD -MF $out.d -c -o $out $in

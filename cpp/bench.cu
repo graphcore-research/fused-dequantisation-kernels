@@ -1,6 +1,5 @@
 /**
- * Standalone benchmark for CUDA transfer bandwidth
- * (read-only, write-only, read + write = memcpy).
+ * Standalone benchmarks for dequantisation implemented in CUDA.
  */
 
 #include <algorithm>
@@ -11,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -22,8 +22,42 @@
 #include <thrust/host_vector.h>
 #include <thrust/sequence.h>
 
+#include <cublasLt.h>
+
 // --------------------------
 // Utilities
+
+using bfloat16 = __nv_bfloat16;
+using bfloat162 = __nv_bfloat162;
+
+struct half8 {
+    half2 data[4];
+};
+struct bfloat168 {
+    bfloat162 data[4];
+};
+
+template <class R, class T>
+__device__ inline R reinterpret(T&& t) {
+    static_assert(sizeof(R) == sizeof(T), "reinterpret size mismatch");
+    return *reinterpret_cast<const R*>(&t);
+}
+
+// Lookup-table based 3-input logical operation (explicit as compiler doesn't generate in all cases)
+template <uint immLut>
+__device__ inline uint lop3(uint a, uint b, uint c) {
+    uint d;
+    asm volatile("lop3.b32 \t%0, %1, %2, %3, %4;" : "=r"(d) : "r"(a), "r"(b), "r"(c), "n"(immLut));
+    return d;
+}
+constexpr uint LOP_A = 0xf0;
+constexpr uint LOP_B = 0xcc;
+constexpr uint LOP_C = 0xaa;
+
+// __device__ inline bfloat16 ldg(const bfloat16* ptr) {
+//     return __ldg(reinterpret_cast<const uint16_t*>(ptr));
+// }
+// reinterpret<bfloat162>(__ldg(&lut_u[idx & 0xFF]));
 
 void check_cuda_error(const std::string& lib, int status, const std::string& file, int line) {
     if (status) {
@@ -36,6 +70,7 @@ void check_cuda_error(const std::string& lib, int status, const std::string& fil
     }
 }
 #define CHECK_CUDA(call) check_cuda_error("CUDA", call, __FILE__, __LINE__);
+#define CHECK_CUBLAS(call) check_cuda_error("cuBLAS", call, __FILE__, __LINE__);
 
 struct Stream {
     cudaStream_t stream;
@@ -43,6 +78,15 @@ struct Stream {
     ~Stream() { cudaStreamDestroy(stream); }
     operator cudaStream_t() const { return stream; }
 };
+
+template <class T>
+size_t count_bytes(std::initializer_list<thrust::device_vector<T>> vectors) {
+    size_t total = 0;
+    for (const auto& v : vectors) {
+        total += v.size() * sizeof(T);
+    }
+    return total;
+}
 
 std::string get_current_timestamp() {
     auto now = std::chrono::system_clock::now();
@@ -67,10 +111,13 @@ std::string get_cuda_version() {
 }
 
 struct Log {
+    using Value = std::variant<std::string, double, int64_t, uint64_t>;
+    using Args = std::vector<std::tuple<std::string, Value>>;
     std::string id;
     std::ofstream file;
+    std::vector<std::tuple<std::string, Value>> meta;
 
-    Log() {
+    explicit Log(Args meta_) : meta(meta_) {
         id = "cpp-" + get_current_timestamp();
         std::string log_dir = "out/dev";
         std::string log_path = log_dir + "/" + id + ".jsonl";
@@ -83,19 +130,20 @@ struct Log {
             std::cerr << "Failed to open log file: " << log_path << std::endl;
             throw std::runtime_error("Failed to open log file: " + log_path);
         }
+        meta.push_back({"id", id});
     }
 
-    void operator()(
-        std::initializer_list<
-            std::pair<std::string, std::variant<std::string, double, int64_t, uint64_t>>> entries) {
+    void operator()(Args entries) {
+        Args line = entries;
+        line.insert(line.end(), meta.begin(), meta.end());
         file << "{";
         bool first = true;
-        for (const auto& entry : entries) {
+        for (const auto& entry : line) {
             if (!first) {
                 file << ",";
             }
             first = false;
-            file << "\"" << entry.first << "\":";
+            file << "\"" << std::get<0>(entry) << "\":";
             std::visit(
                 [&](auto&& arg) {
                     using T = std::decay_t<decltype(arg)>;
@@ -105,7 +153,7 @@ struct Log {
                         file << arg;
                     }
                 },
-                entry.second);
+                std::get<1>(entry));
         }
         file << "}" << std::endl;
     }
@@ -155,27 +203,21 @@ __global__ void kernel__fill_u4(uint4* out, size_t n, uint4 value) {
 }
 
 // --------------------------
-// Main kernels
-
-template <class R, class T>
-__device__ inline R reinterpret(T&& t) {
-    return *reinterpret_cast<const R*>(&t);
-}
+// Conversion kernels
 
 __global__ void kernel__copy_lut8(const uint4* in,
-                                  const __nv_bfloat16* scale,
-                                  const __nv_bfloat162* lut,
-                                  __nv_bfloat16* out,
+                                  const bfloat16* scale,
+                                  const bfloat162* lut,
+                                  bfloat16* out,
                                   size_t n,
                                   size_t group_size) {
     const auto offset = blockIdx.x * blockDim.x + threadIdx.x;
     const auto stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    const uint32_t* lut_u = reinterpret_cast<const uint32_t*>(lut);
-    auto lookup = [lut_u](uint32_t idx, __nv_bfloat16 s) {
-        auto vi = reinterpret<__nv_bfloat162>(__ldg(&lut_u[idx & 0xFF]));
-        return reinterpret<uint32_t>(vi * __nv_bfloat162{s, s});
+    auto lookup = [lut](uint32_t idx, bfloat16 s) {
+        auto v = __ldg(&lut[idx & 0xFF]);
+        return reinterpret<uint32_t>(v * bfloat162{s, s});
     };
-    auto lookup_x4 = [lut_u, lookup](uint32_t v, __nv_bfloat16 s) {
+    auto lookup_x4 = [lookup](uint32_t v, bfloat16 s) {
         uint4 res;
         res.x = lookup(v >> 0, s);
         res.y = lookup(v >> 8, s);
@@ -196,19 +238,18 @@ __global__ void kernel__copy_lut8(const uint4* in,
 }
 
 __global__ void kernel__copy_lut4(const uint4* in,
-                                  const __nv_bfloat16* scale,
-                                  const __nv_bfloat16* lut,
-                                  __nv_bfloat16* out,
+                                  const bfloat16* scale,
+                                  const bfloat16* lut,
+                                  bfloat16* out,
                                   size_t n,
                                   size_t group_size) {
     const auto offset = blockIdx.x * blockDim.x + threadIdx.x;
     const auto stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    const uint16_t* lut_u = reinterpret_cast<const uint16_t*>(lut);
-    auto lookup = [lut_u](uint32_t idx, __nv_bfloat16 s) {
-        auto vi = reinterpret<__nv_bfloat16>(__ldg(&lut_u[idx & 0xF]));
-        return reinterpret<uint32_t>(vi * s);
+    auto lookup = [lut](uint32_t idx, bfloat16 s) {
+        auto v = __ldg(&lut[idx & 0xF]);
+        return static_cast<uint32_t>(reinterpret<uint16_t>(v * s));
     };
-    auto lookup_x8 = [lut_u, lookup](uint32_t v, __nv_bfloat16 s) {
+    auto lookup_x8 = [lookup](uint32_t v, bfloat16 s) {
         uint4 res;
         res.x = (lookup(v >> 0, s) << 16) | lookup(v >> 4, s);
         res.y = (lookup(v >> 8, s) << 16) | lookup(v >> 12, s);
@@ -228,20 +269,6 @@ __global__ void kernel__copy_lut4(const uint4* in,
     }
 }
 
-// Lookup-table based 3-input logical operation (explicit as compiler doesn't generate in all cases)
-template <uint immLut>
-__device__ inline uint lop3(uint a, uint b, uint c) {
-    uint d;
-    asm volatile("lop3.b32 \t%0, %1, %2, %3, %4;" : "=r"(d) : "r"(a), "r"(b), "r"(c), "n"(immLut));
-    return d;
-}
-constexpr uint LOP_A = 0xf0;
-constexpr uint LOP_B = 0xcc;
-constexpr uint LOP_C = 0xaa;
-
-struct half8 {
-    half2 data[4];
-};
 __device__ inline half8 dequant_linear4_fp16(uint q, half s) {
     const auto MASK = 0x64006400u;
     const auto a = reinterpret<half2>(0x64086408);  // {1032, 1032}
@@ -282,33 +309,86 @@ __global__ void kernel__copy_linear4_fp16(const uint4* in,
     }
 }
 
+__device__ inline bfloat168 dequant_binary(uint8_t q, bfloat16 s) {
+    uint16_t res[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        res[i] = reinterpret<uint16_t>(-s);
+        res[i] ^= (uint16_t(q) << (8 + i)) & 0x8000;
+    }
+    return reinterpret<bfloat168>(res);
+}
+
 __global__ void kernel__copy_binary(const uint32_t* in,
-                                    const __nv_bfloat16* scale,
-                                    __nv_bfloat16* out,
+                                    const bfloat16* scale,
+                                    bfloat16* out,
                                     size_t n,
                                     size_t group_size) {
     const auto offset = blockIdx.x * blockDim.x + threadIdx.x;
     const auto stride = static_cast<size_t>(blockDim.x) * gridDim.x;
     uint4* out_u4 = reinterpret_cast<uint4*>(out);
-    auto unpack8 = [](uint8_t v, __nv_bfloat16 s) {
-        uint16_t res[8];
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            res[i] = reinterpret<uint16_t>(-s);
-            res[i] ^= (uint16_t(v) << (8 + i)) & 0x8000;
-        }
-        return reinterpret<uint4>(res);
-    };
     for (auto i = offset; i < n; i += stride) {
         // Each iteration, read 4 bytes, and write 32 * 2-byte outputs
         auto v = in[i];
         auto s = scale[i / group_size];
         // little-endian, and we want to read MSB first
-        out_u4[4 * i + 0] = unpack8((v >> 24) & 0xFF, s);
-        out_u4[4 * i + 1] = unpack8((v >> 16) & 0xFF, s);
-        out_u4[4 * i + 2] = unpack8((v >> 8) & 0xFF, s);
-        out_u4[4 * i + 3] = unpack8((v >> 0) & 0xFF, s);
+        out_u4[4 * i + 0] = reinterpret<uint4>(dequant_binary((v >> 24) & 0xFF, s));
+        out_u4[4 * i + 1] = reinterpret<uint4>(dequant_binary((v >> 16) & 0xFF, s));
+        out_u4[4 * i + 2] = reinterpret<uint4>(dequant_binary((v >> 8) & 0xFF, s));
+        out_u4[4 * i + 3] = reinterpret<uint4>(dequant_binary((v >> 0) & 0xFF, s));
     }
+}
+
+// --------------------------
+// Matrix-vector kernels
+
+__global__ void kernel__mv(const bfloat16* a,  // [k]
+                           const bfloat16* b,  // [k, n] (k-major)
+                           bfloat16* out,      // [n]
+                           int k,
+                           int n) {
+    extern __shared__ float2 shared[];
+    const auto in2 = blockIdx.x * blockDim.x + threadIdx.x;
+    const auto a2 = reinterpret_cast<const bfloat162*>(a);
+    const auto b2 = reinterpret_cast<const bfloat162*>(b);
+    const auto out2 = reinterpret_cast<bfloat162*>(out);
+    if (in2 < n / 2) {
+        // Partial dot product for outputs n = [2*in2, 2*in2+1]
+        // with partial sums spread across threadIdx.y
+        float2 sum = {0.0f, 0.0f};
+        for (auto ik2 = threadIdx.y; ik2 < k / 2; ik2 += blockDim.y) {
+            auto a_ik = __bfloat1622float2(a2[ik2]);
+            auto b_ik0 = __bfloat1622float2(b2[(2 * ik2) * n / 2 + in2]);
+            auto b_ik1 = __bfloat1622float2(b2[(2 * ik2 + 1) * n / 2 + in2]);
+            sum.x = fmaf(a_ik.x, b_ik0.x, sum.x);  // n = 2*in2, k = 2*ik2
+            sum.x = fmaf(a_ik.y, b_ik1.x, sum.x);  // n = 2*in2, k = 2*ik2+1
+            sum.y = fmaf(a_ik.x, b_ik0.y, sum.y);  // n = 2*in2+1, k = 2*ik2
+            sum.y = fmaf(a_ik.y, b_ik1.y, sum.y);  // n = 2*in2+1, k = 2*ik2+1
+        }
+        // Reduce over threadIdx.y in shared memory
+        auto sbase = threadIdx.x * blockDim.y;
+        shared[sbase + threadIdx.y] = sum;
+        __syncthreads();
+        if (threadIdx.y == 0) {
+            // A linear reduction is fine - this isn't the bottleneck
+            for (auto i = 1u; i < blockDim.y; ++i) {
+                sum.x += shared[sbase + i].x;
+                sum.y += shared[sbase + i].y;
+            }
+            out2[in2] = __float22bfloat162_rn(sum);
+        }
+    }
+}
+
+void run_mv(const bfloat16* a, const bfloat16* b, bfloat16* out, int k, int n) {
+    if (n % 2 != 0 || k % 2 != 0) {
+        throw std::invalid_argument("kernel__mv requires n and k to be even");
+    }
+    dim3 blockDim(32, 32);  // [bn, bk]
+    dim3 gridDim((n + blockDim.x - 1) / (2 * blockDim.x), 1);
+    auto sharedBytes = blockDim.y * blockDim.x * sizeof(float2);
+    kernel__mv<<<gridDim, blockDim, sharedBytes>>>(a, b, out, k, n);
+    CHECK_CUDA(cudaGetLastError());
 }
 
 // --------------------------
@@ -335,14 +415,14 @@ void expect_eq(const T& expected, const T& actual, const std::string& msg, T tol
 
 void test_lut() {
     // Problem
-    thrust::device_vector<__nv_bfloat16> d_lut4(16);
+    thrust::device_vector<bfloat16> d_lut4(16);
     for (int i = 0; i < 16; i++) {
         d_lut4[i] = __float2bfloat16(i - 8);
     }
     thrust::device_vector<uint8_t> d_in({0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF});
     thrust::host_vector<float> expected({-8.0f, -7.0f, -6.0f, -5.0f, -4.0f, -3.0f, -2.0f, -1.0f,
                                          0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f});
-    thrust::device_vector<__nv_bfloat16> d_scale = {1.0f, 128.0f, 1 / 256.0f, 1.0f};
+    thrust::device_vector<bfloat16> d_scale = {1.0f, 128.0f, 1 / 256.0f, 1.0f};
     const size_t group_size = 64;
     const size_t n = d_scale.size() * group_size;
 
@@ -361,7 +441,7 @@ void test_lut() {
 
     // 4-bit LUT
     {
-        thrust::device_vector<__nv_bfloat16> d_out(n);
+        thrust::device_vector<bfloat16> d_out(n);
         const float sentinel = 1.96875f;
         d_out.push_back(sentinel);
         kernel__copy_lut4<<<3, 2>>>(reinterpret_cast<const uint4*>(d_in.data().get()),
@@ -377,13 +457,13 @@ void test_lut() {
 
     // 8-bit LUT
     {
-        thrust::host_vector<__nv_bfloat162> h_lut8(256);
+        thrust::host_vector<bfloat162> h_lut8(256);
         for (int i = 0; i < 256; i++) {
-            h_lut8[i] = __nv_bfloat162(d_lut4[i / 16], d_lut4[i % 16]);
+            h_lut8[i] = bfloat162(d_lut4[i / 16], d_lut4[i % 16]);
         }
-        thrust::device_vector<__nv_bfloat162> d_lut8 = h_lut8;
+        thrust::device_vector<bfloat162> d_lut8 = h_lut8;
 
-        thrust::device_vector<__nv_bfloat16> d_out(n);
+        thrust::device_vector<bfloat16> d_out(n);
         const float sentinel = 1.96875f;
         d_out.push_back(sentinel);
         kernel__copy_lut8<<<3, 2>>>(reinterpret_cast<const uint4*>(d_in.data().get()),
@@ -438,7 +518,7 @@ void test_linear4_fp16() {
 void test_binary() {
     // Problem
     thrust::device_vector<uint32_t> d_in({0b11100000'10101010'00000000'11111111, 0xf1234567});
-    thrust::device_vector<__nv_bfloat16> d_scale = {3.0f, 0.5f, 1.0f, 2.0f};
+    thrust::device_vector<bfloat16> d_scale = {3.0f, 0.5f, 1.0f, 2.0f};
     const size_t group_size = 64;
     assert(32 * d_in.size() == group_size);
     const size_t n = group_size * d_scale.size();
@@ -464,7 +544,7 @@ void test_binary() {
     }
 
     // Test
-    thrust::device_vector<__nv_bfloat16> d_out(n);
+    thrust::device_vector<bfloat16> d_out(n);
     const float sentinel = 1.96875f;
     d_out.push_back(sentinel);
     kernel__copy_binary<<<3, 2>>>(d_in.data().get(), d_scale.data().get(), d_out.data().get(),
@@ -476,12 +556,46 @@ void test_binary() {
     }
 }
 
+void test_mv() {
+    const int k = 180;
+    const int n = 250;
+    thrust::host_vector<bfloat16> h_a(k);
+    thrust::host_vector<bfloat16> h_b(k * n);
+    std::default_random_engine rng(1234);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (int i = 0; i < k; i++) {
+        h_a[i] = __float2bfloat16(dist(rng));
+    }
+    for (int i = 0; i < k * n; i++) {
+        h_b[i] = __float2bfloat16(dist(rng));
+    }
+    thrust::host_vector<bfloat16> expected(n);
+    for (int j = 0; j < n; j++) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; i++) {
+            sum += __bfloat162float(h_a[i]) * __bfloat162float(h_b[i * n + j]);
+        }
+        expected[j] = __float2bfloat16(sum);
+    }
+
+    thrust::device_vector<bfloat16> d_a = h_a;
+    thrust::device_vector<bfloat16> d_b = h_b;
+    thrust::device_vector<bfloat16> d_out(n);
+    run_mv(d_a.data().get(), d_b.data().get(), d_out.data().get(), k, n);
+    thrust::host_vector<bfloat16> h_out = d_out;
+
+    for (int i = 0; i < n; i++) {
+        expect_eq(__bfloat162float(expected[i]), __bfloat162float(h_out[i]),
+                  "mv output at index " + std::to_string(i), 1e-3f);
+    }
+}
+
 // --------------------------
 // Benchmarking
 
-double measure_time(uint reps, cudaStream_t stream, const std::function<void()>& fn) {
+double measure_time(uint reps, cudaStream_t stream, const std::function<void(uint)>& fn) {
     for (uint i = 0; i < reps; i++) {
-        fn();
+        fn(i);
     }
     CHECK_CUDA(cudaStreamSynchronize(stream));
 
@@ -491,7 +605,7 @@ double measure_time(uint reps, cudaStream_t stream, const std::function<void()>&
 
     CHECK_CUDA(cudaEventRecord(start, stream));
     for (uint i = 0; i < reps; i++) {
-        fn();
+        fn(i);
     }
     CHECK_CUDA(cudaEventRecord(end, stream));
     CHECK_CUDA(cudaEventSynchronize(end));
@@ -504,32 +618,12 @@ double measure_time(uint reps, cudaStream_t stream, const std::function<void()>&
     return time_ms * 1e-3 / reps;
 }
 
-// --------------------------
-// Driver program
-
-int main() {
-    // Tests
-    test_lut();
-    test_linear4_fp16();
-    test_binary();
-
-    // Problem size
+void benchmark_conversions(Log& log) {
     constexpr size_t bytes = 4 * (1ull << 30);
     static_assert(bytes % 16 == 0, "bytes must be a multiple of 16 for uint4 fill");
     const uint reps = 10;
-    // std::regex pattern("^(copy|copy_lut8|copy_lut4|copy_linear4_fp16)$");
-    std::regex pattern(".*");
+    std::regex pattern("^(.*)$");
 
-    // Device info
-    auto device_name = get_device_name();
-    auto cuda_version = get_cuda_version();
-    std::cerr << "Using device: " << device_name << std::endl;
-    std::cerr << "CUDA version: " << cuda_version << std::endl;
-    std::cerr << "Bytes: " << bytes << " (" << (bytes / (1ull << 30)) << " GiB)" << std::endl;
-    std::cerr << std::endl;
-
-    // Benchmarking
-    Log log;
     Stream stream;
     thrust::device_vector<uint8_t> d_a(bytes);
     thrust::device_vector<uint8_t> d_b(bytes);
@@ -537,7 +631,7 @@ int main() {
     thrust::fill(thrust::cuda::par.on(stream), d_b.begin(), d_b.end(), 0);
 
     auto run_benchmark = [&](const std::string& name, size_t bytes_read, size_t bytes_write,
-                             const std::function<void()>& fn) {
+                             const std::function<void(uint)>& fn) {
         if (!std::regex_match(name, pattern)) {
             return;
         }
@@ -555,22 +649,19 @@ int main() {
              {"avg_time", avg_time},
              {"bytes_read", static_cast<uint64_t>(bytes_read)},
              {"bytes_write", static_cast<uint64_t>(bytes_write)},
-             {"reps", static_cast<uint64_t>(reps)},
-             {"id", log.id},
-             {"device", device_name},
-             {"cuda_version", cuda_version}});
+             {"reps", static_cast<uint64_t>(reps)}});
     };
 
-    std::cerr << "### Bench" << std::endl;
+    std::cerr << "### benchmark_conversions" << std::endl;
 
     // Baseline measurements
 
-    run_benchmark("cudamemcpy", bytes, bytes, [&]() {
+    run_benchmark("cudamemcpy", bytes, bytes, [&](uint) {
         CHECK_CUDA(cudaMemcpyAsync(d_b.data().get(), d_a.data().get(), bytes,
                                    cudaMemcpyDeviceToDevice, stream));
     });
 
-    run_benchmark("copy", bytes, bytes, [&]() {
+    run_benchmark("copy", bytes, bytes, [&](uint) {
         int threads = 1024;
         int blocks = 65536;
         const size_t n4 = bytes / sizeof(uint4);
@@ -581,7 +672,7 @@ int main() {
     });
 
     thrust::device_vector<unsigned long long> d_sum(1);
-    run_benchmark("read_reduce_sum", bytes, sizeof(unsigned long long), [&]() {
+    run_benchmark("read_reduce_sum", bytes, sizeof(unsigned long long), [&](uint) {
         CHECK_CUDA(cudaMemsetAsync(d_sum.data().get(), 0, sizeof(unsigned long long), stream));
         int threads = 1024;
         int blocks = 16384;
@@ -591,7 +682,7 @@ int main() {
         CHECK_CUDA(cudaGetLastError());
     });
 
-    run_benchmark("write_fill", sizeof(uint4), bytes, [&]() {
+    run_benchmark("write_fill", sizeof(uint4), bytes, [&](uint) {
         int threads = 1024;
         int blocks = 65536;  // since we have a lot of memory to fill
         const uint32_t v = 0x12345678u;
@@ -605,25 +696,25 @@ int main() {
 
     // LUT8
     {
-        const auto n = bytes / sizeof(__nv_bfloat16);
+        const auto n = bytes / sizeof(bfloat16);
         const auto g = 64;
-        const auto bytes_read = n / 2 + n / g * sizeof(__nv_bfloat16);
-        const auto bytes_write = n * sizeof(__nv_bfloat16);
+        const auto bytes_read = n / 2 + n / g * sizeof(bfloat16);
+        const auto bytes_write = n * sizeof(bfloat16);
 
-        thrust::device_vector<__nv_bfloat16> d_b16(n);
-        thrust::device_vector<__nv_bfloat16> d_scale(n / g, 0.01f);
-        thrust::host_vector<__nv_bfloat162> h_lut8(256);
+        thrust::device_vector<bfloat16> d_b16(n);
+        thrust::device_vector<bfloat16> d_scale(n / g, 0.01f);
+        thrust::host_vector<bfloat162> h_lut8(256);
         for (int i = 0; i < 256; i++) {
-            h_lut8[i] = __nv_bfloat162{i % 16, i / 16};
+            h_lut8[i] = bfloat162{i % 16, i / 16};
         }
-        thrust::device_vector<__nv_bfloat162> d_lut8(256);
+        thrust::device_vector<bfloat162> d_lut8(256);
         thrust::copy(h_lut8.begin(), h_lut8.end(), d_lut8.begin());
-        run_benchmark("copy_lut8", bytes_read, bytes_write, [&]() {
+        run_benchmark("copy_lut8", bytes_read, bytes_write, [&](uint) {
             int threads = 1024;
             int blocks = 65536;
             kernel__copy_lut8<<<blocks, threads, 0, stream>>>(
                 reinterpret_cast<const uint4*>(d_a.data().get()), d_scale.data().get(),
-                d_lut8.data().get(), reinterpret_cast<__nv_bfloat16*>(d_b16.data().get()), n / 32,
+                d_lut8.data().get(), reinterpret_cast<bfloat16*>(d_b16.data().get()), n / 32,
                 g / 32);
             CHECK_CUDA(cudaGetLastError());
         });
@@ -631,25 +722,25 @@ int main() {
 
     // LUT4
     {
-        const auto n = bytes / sizeof(__nv_bfloat16);
+        const auto n = bytes / sizeof(bfloat16);
         const auto g = 64;
-        const auto bytes_read = n / 2 + n / g * sizeof(__nv_bfloat16);
-        const auto bytes_write = n * sizeof(__nv_bfloat16);
+        const auto bytes_read = n / 2 + n / g * sizeof(bfloat16);
+        const auto bytes_write = n * sizeof(bfloat16);
 
-        thrust::device_vector<__nv_bfloat16> d_b16(n);
-        thrust::device_vector<__nv_bfloat16> d_scale(n / g, 0.01f);
-        thrust::host_vector<__nv_bfloat16> h_lut4(16);
+        thrust::device_vector<bfloat16> d_b16(n);
+        thrust::device_vector<bfloat16> d_scale(n / g, 0.01f);
+        thrust::host_vector<bfloat16> h_lut4(16);
         for (int i = 0; i < 16; i++) {
-            h_lut4[i] = __nv_bfloat16(i);
+            h_lut4[i] = bfloat16(i);
         }
-        thrust::device_vector<__nv_bfloat16> d_lut4(16);
+        thrust::device_vector<bfloat16> d_lut4(16);
         thrust::copy(h_lut4.begin(), h_lut4.end(), d_lut4.begin());
-        run_benchmark("copy_lut4", bytes_read, bytes_write, [&]() {
+        run_benchmark("copy_lut4", bytes_read, bytes_write, [&](uint) {
             int threads = 1024;
             int blocks = 65536;
             kernel__copy_lut4<<<blocks, threads, 0, stream>>>(
                 reinterpret_cast<const uint4*>(d_a.data().get()), d_scale.data().get(),
-                d_lut4.data().get(), reinterpret_cast<__nv_bfloat16*>(d_b16.data().get()), n / 32,
+                d_lut4.data().get(), reinterpret_cast<bfloat16*>(d_b16.data().get()), n / 32,
                 g / 32);
             CHECK_CUDA(cudaGetLastError());
         });
@@ -664,7 +755,7 @@ int main() {
 
         thrust::device_vector<half> d_fp16(n);
         thrust::device_vector<half> d_scale(n / g, 0.01f);
-        run_benchmark("copy_linear4_fp16", bytes_read, bytes_write, [&]() {
+        run_benchmark("copy_linear4_fp16", bytes_read, bytes_write, [&](uint) {
             int threads = 1024;
             int blocks = 65536;
             kernel__copy_linear4_fp16<<<blocks, threads, 0, stream>>>(
@@ -676,14 +767,14 @@ int main() {
 
     // Binary
     {
-        const auto n = bytes / sizeof(__nv_bfloat16);
+        const auto n = bytes / sizeof(bfloat16);
         const auto g = 64;
-        const auto bytes_read = n / 8 + n / g * sizeof(__nv_bfloat16);
-        const auto bytes_write = n * sizeof(__nv_bfloat16);
+        const auto bytes_read = n / 8 + n / g * sizeof(bfloat16);
+        const auto bytes_write = n * sizeof(bfloat16);
 
-        thrust::device_vector<__nv_bfloat16> d_b16(n);
-        thrust::device_vector<__nv_bfloat16> d_scale(n / g, 0.01f);
-        run_benchmark("copy_binary", bytes_read, bytes_write, [&]() {
+        thrust::device_vector<bfloat16> d_b16(n);
+        thrust::device_vector<bfloat16> d_scale(n / g, 0.01f);
+        run_benchmark("copy_binary", bytes_read, bytes_write, [&](uint) {
             int threads = 1024;
             int blocks = 65536;
             kernel__copy_binary<<<blocks, threads, 0, stream>>>(
@@ -692,6 +783,108 @@ int main() {
             CHECK_CUDA(cudaGetLastError());
         });
     }
+
+    std::cerr << std::endl;
+}
+
+void benchmark_mv(Log& log) {
+    const int k = 8192;
+    const int n = 4096;
+    const int reps = 100;
+    const int copies = 10;  // cycle through separate args to avoid cache hits
+
+    Stream stream;
+
+    auto run_benchmark = [&](const std::string& name, size_t bytes_read, size_t bytes_write,
+                             const std::function<void(uint)>& fn) {
+        double avg_time = measure_time(reps, stream, fn);
+        std::ostringstream time_str, bw_str;
+        time_str << std::fixed << std::setprecision(2) << (avg_time * 1e6) << " us";
+        bw_str << std::fixed << std::setprecision(2)
+               << ((bytes_read + bytes_write) / avg_time) / 1e9 << " GB/s";
+        std::cerr << std::setw(18) << std::left << name << "  " << std::setw(12) << std::right
+                  << time_str.str() << "  " << std::setw(12) << std::right << bw_str.str()
+                  << std::endl;
+
+        // Write JSON log (one object per measurement)
+        log({{"test", name},
+             {"avg_time", avg_time},
+             {"bytes_read", static_cast<uint64_t>(bytes_read)},
+             {"bytes_write", static_cast<uint64_t>(bytes_write)},
+             {"reps", static_cast<uint64_t>(reps)}});
+    };
+
+    std::cerr << "### benchmark_mv" << std::endl;
+
+    // cublaslt_mv
+    {
+        thrust::device_vector<bfloat16> d_a(copies * k, 1.5f);
+        thrust::device_vector<bfloat16> d_b(copies * k * n, 0.125f);
+        thrust::device_vector<bfloat16> d_out(copies * n);
+        float alpha = 1.0f;
+        float beta = 0.0f;
+
+        // "Light" API setup
+        cublasLtHandle_t ltHandle;
+        CHECK_CUBLAS(cublasLtCreate(&ltHandle));
+        cublasLtMatmulDesc_t operationDesc = nullptr;
+        cublasLtMatrixLayout_t adesc = nullptr, bdesc = nullptr, cdesc = nullptr;
+        CHECK_CUBLAS(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&adesc, CUDA_R_16BF, k, 1, k));
+        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&bdesc, CUDA_R_16BF, n, k, n));
+        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&cdesc, CUDA_R_16BF, n, 1, n));
+
+        run_benchmark(
+            "cublaslt_mv", (k + k * n) * sizeof(bfloat16), n * sizeof(bfloat16), [&](uint i) {
+                auto idx = i % copies;
+                CHECK_CUBLAS(cublasLtMatmul(
+                    ltHandle, operationDesc, &alpha, d_b.data().get() + idx * k * n, bdesc,
+                    d_a.data().get() + idx * k, adesc, &beta, d_out.data().get() + idx * n, cdesc,
+                    d_out.data().get() + idx * n, cdesc, nullptr, nullptr, 0, stream));
+            });
+
+        CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(adesc));
+        CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(bdesc));
+        CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(cdesc));
+        CHECK_CUBLAS(cublasLtMatmulDescDestroy(operationDesc));
+        CHECK_CUBLAS(cublasLtDestroy(ltHandle));
+    }
+
+    // mv
+    {
+        thrust::device_vector<bfloat16> d_a(copies * k, 1.5f);
+        thrust::device_vector<bfloat16> d_b(copies * k * n, 0.125f);
+        thrust::device_vector<bfloat16> d_out(copies * n);
+        run_benchmark("mv", (k + k * n) * sizeof(bfloat16), n * sizeof(bfloat16), [&](uint i) {
+            auto idx = i % copies;
+            run_mv(d_a.data().get() + idx * k, d_b.data().get() + idx * k * n,
+                   d_out.data().get() + idx * n, k, n);
+        });
+    }
+
+    std::cerr << std::endl;
+}
+
+// --------------------------
+// Driver program
+
+int main() {
+    auto device_name = get_device_name();
+    auto cuda_version = get_cuda_version();
+    std::cerr << "Using device: " << device_name << std::endl;
+    std::cerr << "CUDA version: " << cuda_version << std::endl;
+    std::cerr << std::endl;
+
+    // Tests
+    test_lut();
+    test_linear4_fp16();
+    test_binary();
+    test_mv();
+
+    // Benchmarking
+    Log log({{"device", device_name}, {"cuda_version", cuda_version}});
+    benchmark_conversions(log);
+    benchmark_mv(log);
 
     return 0;
 }
