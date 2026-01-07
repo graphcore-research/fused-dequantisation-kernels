@@ -185,7 +185,7 @@ __global__ void kernel__copy_lut8(const uint4* in,
     };
     uint4* out_u4 = reinterpret_cast<uint4*>(out);
     for (auto i = offset; i < n; i += stride) {
-        // Each iteration, read 4 * 4 = 16 bytes, and write 16 * 4-byte outputs
+        // Each iteration, read 4 * 4 = 16 bytes, and write 32 * 2-byte outputs
         auto v = in[i];
         auto s = scale[i / group_size];
         out_u4[4 * i + 0] = lookup_x4(v.x, s);
@@ -282,6 +282,35 @@ __global__ void kernel__copy_linear4_fp16(const uint4* in,
     }
 }
 
+__global__ void kernel__copy_binary(const uint32_t* in,
+                                    const __nv_bfloat16* scale,
+                                    __nv_bfloat16* out,
+                                    size_t n,
+                                    size_t group_size) {
+    const auto offset = blockIdx.x * blockDim.x + threadIdx.x;
+    const auto stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    uint4* out_u4 = reinterpret_cast<uint4*>(out);
+    auto unpack8 = [](uint8_t v, __nv_bfloat16 s) {
+        uint16_t res[8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            res[i] = reinterpret<uint16_t>(-s);
+            res[i] ^= (uint16_t(v) << (8 + i)) & 0x8000;
+        }
+        return reinterpret<uint4>(res);
+    };
+    for (auto i = offset; i < n; i += stride) {
+        // Each iteration, read 4 bytes, and write 32 * 2-byte outputs
+        auto v = in[i];
+        auto s = scale[i / group_size];
+        // little-endian, and we want to read MSB first
+        out_u4[4 * i + 0] = unpack8((v >> 24) & 0xFF, s);
+        out_u4[4 * i + 1] = unpack8((v >> 16) & 0xFF, s);
+        out_u4[4 * i + 2] = unpack8((v >> 8) & 0xFF, s);
+        out_u4[4 * i + 3] = unpack8((v >> 0) & 0xFF, s);
+    }
+}
+
 // --------------------------
 // Testing
 
@@ -325,24 +354,23 @@ void test_lut() {
         d_in.insert(d_in.end(), d_in_initial.begin(), d_in_initial.end());
         expected.insert(expected.end(), expected_initial.begin(), expected_initial.end());
     }
+    // Apply scale
     for (size_t i = 0; i < expected.size(); i++) {
         expected[i] *= __bfloat162float(d_scale[i / group_size]);
     }
-    // Append a sentinel to the end of expected, to check overrun
-    const float sentinel = 1.96875f;
-    expected.push_back(sentinel);
 
     // 4-bit LUT
     {
-        thrust::device_vector<__nv_bfloat16> d_out(expected.size());
-        d_out.back() = __float2bfloat16(sentinel);
+        thrust::device_vector<__nv_bfloat16> d_out(n);
+        const float sentinel = 1.96875f;
+        d_out.push_back(sentinel);
         kernel__copy_lut4<<<3, 2>>>(reinterpret_cast<const uint4*>(d_in.data().get()),
                                     d_scale.data().get(), d_lut4.data().get(), d_out.data().get(),
                                     n / 32, group_size / 32);
         CHECK_CUDA(cudaGetLastError());
-        thrust::host_vector<__nv_bfloat16> h_out = d_out;
-        for (size_t i = 0; i < expected.size(); i++) {
-            float v = __bfloat162float(h_out[i]);
+        expect_eq(sentinel, __bfloat162float(d_out.back()), "sentinel check");
+        for (size_t i = 0; i < n; i++) {
+            float v = __bfloat162float(d_out[i]);
             expect_eq(expected[i], v, "at index " + std::to_string(i), 1e-3f);
         }
     }
@@ -355,15 +383,16 @@ void test_lut() {
         }
         thrust::device_vector<__nv_bfloat162> d_lut8 = h_lut8;
 
-        thrust::device_vector<__nv_bfloat16> d_out(expected.size());
-        d_out.back() = __float2bfloat16(sentinel);
+        thrust::device_vector<__nv_bfloat16> d_out(n);
+        const float sentinel = 1.96875f;
+        d_out.push_back(sentinel);
         kernel__copy_lut8<<<3, 2>>>(reinterpret_cast<const uint4*>(d_in.data().get()),
                                     d_scale.data().get(), d_lut8.data().get(), d_out.data().get(),
                                     n / 32, group_size / 32);
         CHECK_CUDA(cudaGetLastError());
-        thrust::host_vector<__nv_bfloat16> h_out = d_out;
-        for (size_t i = 0; i < expected.size(); i++) {
-            float v = __bfloat162float(h_out[i]);
+        expect_eq(sentinel, __bfloat162float(d_out.back()), "sentinel check");
+        for (size_t i = 0; i < n; i++) {
+            float v = __bfloat162float(d_out[i]);
             expect_eq(v, expected[i], "at index " + std::to_string(i), 1e-3f);
         }
     }
@@ -386,24 +415,64 @@ void test_linear4_fp16() {
         d_in.insert(d_in.end(), d_in_initial.begin(), d_in_initial.end());
         expected.insert(expected.end(), expected_initial.begin(), expected_initial.end());
     }
+    // Apply scale
     for (size_t i = 0; i < expected.size(); i++) {
         expected[i] *= __half2float(d_scale[i / group_size]);
     }
-    // Append a sentinel to the end of expected, to check overrun
-    const float sentinel = 1.96875f;
-    expected.push_back(sentinel);
 
     // Test
-    thrust::device_vector<half> d_out(expected.size());
-    d_out.back() = __float2half(sentinel);
+    thrust::device_vector<half> d_out(n);
+    const float sentinel = 1.96875f;
+    d_out.push_back(sentinel);
     kernel__copy_linear4_fp16<<<3, 2>>>(reinterpret_cast<const uint4*>(d_in.data().get()),
                                         d_scale.data().get(), d_out.data().get(), n / 32,
                                         group_size / 32);
     CHECK_CUDA(cudaGetLastError());
-    thrust::host_vector<half> h_out = d_out;
-    for (size_t i = 0; i < h_out.size(); i++) {
-        float v = __half2float(h_out[i]);
+    expect_eq(sentinel, __half2float(d_out.back()), "sentinel check");
+    for (size_t i = 0; i < n; i++) {
+        float v = __half2float(d_out[i]);
         expect_eq(v, expected[i], "at index " + std::to_string(i), 1e-3f);
+    }
+}
+
+void test_binary() {
+    // Problem
+    thrust::device_vector<uint32_t> d_in({0b11100000'10101010'00000000'11111111, 0xf1234567});
+    thrust::device_vector<__nv_bfloat16> d_scale = {3.0f, 0.5f, 1.0f, 2.0f};
+    const size_t group_size = 64;
+    assert(32 * d_in.size() == group_size);
+    const size_t n = group_size * d_scale.size();
+
+    // Build expected output
+    thrust::host_vector<float> expected;
+    for (auto i = 0u; i < d_in.size(); i++) {
+        for (int b = 31; b >= 0; b--) {
+            expected.push_back((d_in[i] & (1u << b)) ? 1 : -1);
+        }
+    }
+    // Expand {d_in, expected} to be of size n
+    assert(n % expected.size() == 0);
+    const auto d_in_initial = d_in;
+    const auto expected_initial = expected;
+    while (expected.size() < n) {
+        d_in.insert(d_in.end(), d_in_initial.begin(), d_in_initial.end());
+        expected.insert(expected.end(), expected_initial.begin(), expected_initial.end());
+    }
+    // Apply scale
+    for (size_t i = 0; i < expected.size(); i++) {
+        expected[i] *= __bfloat162float(d_scale[i / group_size]);
+    }
+
+    // Test
+    thrust::device_vector<__nv_bfloat16> d_out(n);
+    const float sentinel = 1.96875f;
+    d_out.push_back(sentinel);
+    kernel__copy_binary<<<3, 2>>>(d_in.data().get(), d_scale.data().get(), d_out.data().get(),
+                                  n / 32, group_size / 32);
+    CHECK_CUDA(cudaGetLastError());
+    expect_eq(sentinel, __bfloat162float(d_out.back()), "sentinel check");
+    for (size_t i = 0; i < n; i++) {
+        expect_eq(expected[i], __bfloat162float(d_out[i]), "at index " + std::to_string(i), 1e-3f);
     }
 }
 
@@ -439,6 +508,11 @@ double measure_time(uint reps, cudaStream_t stream, const std::function<void()>&
 // Driver program
 
 int main() {
+    // Tests
+    test_lut();
+    test_linear4_fp16();
+    test_binary();
+
     // Problem size
     constexpr size_t bytes = 4 * (1ull << 30);
     static_assert(bytes % 16 == 0, "bytes must be a multiple of 16 for uint4 fill");
@@ -453,9 +527,6 @@ int main() {
     std::cerr << "CUDA version: " << cuda_version << std::endl;
     std::cerr << "Bytes: " << bytes << " (" << (bytes / (1ull << 30)) << " GiB)" << std::endl;
     std::cerr << std::endl;
-
-    test_lut();
-    test_linear4_fp16();
 
     // Benchmarking
     Log log;
@@ -599,6 +670,25 @@ int main() {
             kernel__copy_linear4_fp16<<<blocks, threads, 0, stream>>>(
                 reinterpret_cast<const uint4*>(d_a.data().get()), d_scale.data().get(),
                 d_fp16.data().get(), n / 32, g / 32);
+            CHECK_CUDA(cudaGetLastError());
+        });
+    }
+
+    // Binary
+    {
+        const auto n = bytes / sizeof(__nv_bfloat16);
+        const auto g = 64;
+        const auto bytes_read = n / 8 + n / g * sizeof(__nv_bfloat16);
+        const auto bytes_write = n * sizeof(__nv_bfloat16);
+
+        thrust::device_vector<__nv_bfloat16> d_b16(n);
+        thrust::device_vector<__nv_bfloat16> d_scale(n / g, 0.01f);
+        run_benchmark("copy_binary", bytes_read, bytes_write, [&]() {
+            int threads = 1024;
+            int blocks = 65536;
+            kernel__copy_binary<<<blocks, threads, 0, stream>>>(
+                reinterpret_cast<const uint32_t*>(d_a.data().get()), d_scale.data().get(),
+                d_b16.data().get(), n / 32, g / 32);
             CHECK_CUDA(cudaGetLastError());
         });
     }
