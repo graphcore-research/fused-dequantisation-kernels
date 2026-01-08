@@ -27,7 +27,7 @@
 // --------------------------
 // Utilities
 
-constexpr int warp_size = 32;
+constexpr uint warp_size = 32;
 using bfloat16 = __nv_bfloat16;
 using bfloat162 = __nv_bfloat162;
 struct half8 {
@@ -443,9 +443,58 @@ struct WeightT_4b_LUT4 {
         return reinterpret_cast<const load_type*>(data)[index];
     }
     __device__ __forceinline__ bfloat162 get(load_type q, int i) const {
-        auto idx0 = (q >> (8 * i + 4)) & 0x0F;
-        auto idx1 = (q >> (8 * i)) & 0x0F;
+        auto idx0 = (q >> (8 * i)) & 0x0F;
+        auto idx1 = (q >> (8 * i + 4)) & 0x0F;
         return bfloat162(__ldg(&lut[idx0]), __ldg(&lut[idx1]));
+    }
+};
+
+struct WeightT_4b_Linear {
+    const uint8_t* data;
+    using load_type = uint32_t;
+    static constexpr int elements_per_load = sizeof(load_type) * 8 / 4;
+
+    __device__ __forceinline__ load_type load(uint index) const {
+        return reinterpret_cast<const load_type*>(data)[index];
+    }
+    __device__ __forceinline__ bfloat162 get(load_type q, int i) const {
+        auto v = q >> (8 * i);
+        auto c0 = static_cast<uint16_t>(lop3<(LOP_A & LOP_B) | LOP_C>(v, 0x000F, 0x4300));
+        auto v0 = reinterpret<bfloat16>(c0) - bfloat16(136);
+        auto c1 = static_cast<uint16_t>(lop3<(LOP_A & LOP_B) | LOP_C>(v >> 4, 0x000F, 0x4300));
+        auto v1 = reinterpret<bfloat16>(c1) - bfloat16(136);
+        return bfloat162(v0, v1);
+
+        // Alternative (no benefit seen)
+        // auto q0 = q >> (8 * i);
+        // auto q1 = (i < 2) ? (q << (12 - 8 * i)) : (q >> (8 * i - 12));
+        // auto v = lop3<(LOP_A & LOP_B) | LOP_C>(q0, 0x0000000F, q1 & 0x000F0000);
+        // auto c = lop3<(LOP_A & LOP_B) | LOP_C>(v, 0x000F000F, 0x43004300);
+        // return reinterpret<bfloat162>(c) - bfloat162(136, 136);
+
+        // Dummy fast version (interleaved encoding order)
+        // auto v = (q >> (4 * i));
+        // auto c = lop3<(LOP_A & LOP_B) | LOP_C>(v, 0x000F000F, 0x43004300);
+        // return reinterpret<bfloat162>(c) - bfloat162{136, 136};
+    }
+};
+
+struct WeightT_Binary {
+    const uint8_t* data;
+    using load_type = uint16_t;
+    static constexpr int elements_per_load = sizeof(load_type) * 8;
+
+    __device__ __forceinline__ load_type load(uint index) const {
+        return reinterpret_cast<const load_type*>(data)[index];
+    }
+    __device__ __forceinline__ bfloat162 get(load_type q, int i) const {
+        auto q32 = uint32_t(q);
+        auto q0 = (2 * i <= 15) ? (q32 << (15 - 2 * i)) : (q32 >> (2 * i - 15));
+        auto q1 = q32 << (30 - 2 * i);
+        auto c = lop3<(LOP_A & LOP_B) | LOP_C>(q0, 0x00008000, q1 & 0x80000000);
+        bfloat162 r = bfloat162(-1, -1);
+        reinterpret_cast<uint32_t&>(r) ^= c;  // flip sign bit
+        return r;
     }
 };
 
@@ -457,7 +506,9 @@ void template_run_mv(const bfloat16* a, WeightT b, ScaleT scale, bfloat16* out, 
             << WeightT::elements_per_load << ")";
         throw std::invalid_argument(oss.str());
     }
-    auto blockSize = 512;
+    // Favour a larger block size (/2 is a heuristic - aim for 2 loop repetitions)
+    auto blockSize =
+        std::clamp((k / 2 / WeightT::elements_per_load / warp_size) * warp_size, warp_size, 1024u);
     auto sharedBytes = (blockSize / warp_size) * sizeof(float);
     kernel__mv<<<n, blockSize, sharedBytes>>>(a, b, scale, out, k);
     CHECK_CUDA(cudaGetLastError());
@@ -493,6 +544,32 @@ void run_mv_4b_lut4(const bfloat16* a,
         throw std::invalid_argument("mv_4b_lut4 requires group_size to be a multiple of 8");
     }
     template_run_mv(a, WeightT_4b_LUT4{b, lut}, ScaleT_Grouped{scale, group_size}, out, k, n);
+}
+
+void run_mv_4b_linear(const bfloat16* a,
+                      const uint8_t* b,
+                      const bfloat16* scale,
+                      bfloat16* out,
+                      uint k,
+                      uint n,
+                      uint group_size) {
+    if (group_size % 8 != 0) {
+        throw std::invalid_argument("mv_4b_linear requires group_size to be a multiple of 8");
+    }
+    template_run_mv(a, WeightT_4b_Linear{b}, ScaleT_Grouped{scale, group_size}, out, k, n);
+}
+
+void run_mv_binary(const bfloat16* a,
+                   const uint8_t* b,
+                   const bfloat16* scale,
+                   bfloat16* out,
+                   uint k,
+                   uint n,
+                   uint group_size) {
+    if (group_size % 32 != 0) {
+        throw std::invalid_argument("mv_binary requires group_size to be a multiple of 32");
+    }
+    template_run_mv(a, WeightT_Binary{b}, ScaleT_Grouped{scale, group_size}, out, k, n);
 }
 
 // --------------------------
@@ -670,46 +747,62 @@ struct ScaledTensor {
     thrust::host_vector<bfloat162> lut8() const {
         thrust::host_vector<bfloat162> h_lut8(256);
         for (int i = 0; i < 256; i++) {
-            h_lut8[i] = bfloat162(lut[i / 16], lut[i % 16]);
+            h_lut8[i] = bfloat162(lut[i % 16], lut[i / 16]);
         }
         return h_lut8;
     }
 };
 
-ScaledTensor quantise_4b_linear(const thrust::host_vector<bfloat16>& input, size_t group_size) {
-    const size_t n = input.size();
-    const size_t bits_per_element = 4;
-    assert(n % group_size == 0);
+ScaledTensor host_quantise_linear(const thrust::host_vector<bfloat16>& input,
+                                  size_t group_size,
+                                  size_t bits_per_element) {
+    assert(input.size() % group_size == 0);
     assert(group_size % 2 == 0);
+    assert(bits_per_element < 8);
+    assert(8 % bits_per_element == 0);
 
+    const size_t elements_per_byte = 8 / bits_per_element;
+    const int v_min = -(1 << (bits_per_element - 1));
+    const int v_max = -v_min - (bits_per_element > 1);
+
+    const size_t n = input.size();
+    thrust::host_vector<uint8_t> h_data(n / elements_per_byte);
     thrust::host_vector<bfloat16> h_scale(n / group_size);
-    thrust::host_vector<uint8_t> h_data(n / (8 / bits_per_element));  // 2 values per byte
     for (size_t g = 0; g < n / group_size; g++) {
         // Find scale
-        float max_abs = 1e-12f;
+        float max_abs = 1e-12f, sum_abs = 1e-12f;
         for (size_t i = 0; i < group_size; i++) {
             float vi = std::abs(__bfloat162float(input[g * group_size + i]));
             max_abs = std::max(max_abs, vi);
+            sum_abs += vi;
         }
-        float scale = max_abs / 7.0f;
-        h_scale[g] = __float2bfloat16(scale);
+        h_scale[g] =
+            __float2bfloat16((bits_per_element == 1) ? (sum_abs / group_size) : (max_abs / v_max));
 
         // Quantise
-        for (size_t i = 0; i < group_size / 2; i++) {
-            float v0 = __bfloat162float(input[g * group_size + 2 * i]) / scale;
-            float v1 = __bfloat162float(input[g * group_size + 2 * i + 1]) / scale;
-            uint8_t q0 =
-                static_cast<uint8_t>(std::clamp(static_cast<int>(std::round(v0) + 8), 0, 15));
-            uint8_t q1 =
-                static_cast<uint8_t>(std::clamp(static_cast<int>(std::round(v1) + 8), 0, 15));
-            h_data[g * (group_size / 2) + i] = (q0 << 4) | q1;
+        for (size_t i = 0; i < group_size; i++) {
+            float v = __bfloat162float(input[g * group_size + i] / h_scale[g]);
+            uint8_t q;
+            if (bits_per_element == 1) {
+                q = (v >= 0);
+            } else {
+                q = static_cast<uint8_t>(std::clamp(static_cast<int>(std::round(v)), v_min, v_max) -
+                                         v_min);
+            }
+            size_t byte_index = (g * group_size + i) / elements_per_byte;
+            size_t bit_offset = (i % elements_per_byte) * bits_per_element;
+            h_data[byte_index] |= (q << bit_offset);
         }
     }
 
     // Build LUT
-    thrust::host_vector<bfloat16> h_lut(16);
-    for (int i = 0; i < 16; i++) {
-        h_lut[i] = __float2bfloat16(i - 8);
+    thrust::host_vector<bfloat16> h_lut(1 << bits_per_element);
+    if (bits_per_element == 1) {
+        h_lut = {-1, 1};
+    } else {
+        for (int v = v_min; v <= v_max; v++) {
+            h_lut[v - v_min] = __float2bfloat16(v);
+        }
     }
 
     ScaledTensor result;
@@ -721,20 +814,19 @@ ScaledTensor quantise_4b_linear(const thrust::host_vector<bfloat16>& input, size
     return result;
 }
 
-thrust::host_vector<bfloat16> dequantise(const ScaledTensor& qt) {
-    assert(qt.bits_per_element == 4);
-    auto n = qt.data.size() * 8 / qt.bits_per_element;
+thrust::host_vector<bfloat16> host_dequantise(const ScaledTensor& qt) {
+    const size_t elements_per_byte = 8 / qt.bits_per_element;
+    const uint8_t mask = (1 << qt.bits_per_element) - 1;
+    auto n = qt.data.size() * elements_per_byte;
     thrust::host_vector<bfloat16> output(n);
     for (size_t g = 0; g < n / qt.group_size; g++) {
-        bfloat16 s = qt.scale[g];
-        for (auto i = 0u; i < qt.group_size / 2; i++) {
-            uint8_t q_byte = qt.data[g * (qt.group_size / 2) + i];
-            uint8_t q0 = (q_byte >> 4) & 0x0F;
-            uint8_t q1 = (q_byte >> 0) & 0x0F;
-            bfloat16 v0 = qt.lut[q0] * s;
-            bfloat16 v1 = qt.lut[q1] * s;
-            output[g * qt.group_size + 2 * i] = v0;
-            output[g * qt.group_size + 2 * i + 1] = v1;
+        auto s = qt.scale[g];
+        for (auto i = 0u; i < qt.group_size; i++) {
+            size_t byte_index = (g * qt.group_size + i) / elements_per_byte;
+            size_t bit_offset = (i % elements_per_byte) * qt.bits_per_element;
+            auto q = (qt.data[byte_index] >> bit_offset) & mask;
+            auto v = qt.lut[q] * s;
+            output[g * qt.group_size + i] = v;
         }
     }
     return output;
@@ -802,7 +894,7 @@ void test_mv() {
 
     // mv_4b_lut8
     {
-        auto qb = quantise_4b_linear(h_b, /*group_size*/ 64);
+        auto qb = host_quantise_linear(h_b, /*group_size*/ 64, 4);
 
         thrust::device_vector<bfloat16> d_a = h_a;
         thrust::device_vector<uint8_t> d_b = qb.data;
@@ -813,7 +905,7 @@ void test_mv() {
                        d_out.data().get(), k, n, qb.group_size);
         thrust::host_vector<bfloat16> h_out = d_out;
 
-        auto qexpected = host_mv(h_a, dequantise(qb), k, n);
+        auto qexpected = host_mv(h_a, host_dequantise(qb), k, n);
         for (int i = 0; i < n; i++) {
             expect_eq(__bfloat162float(qexpected[i]), __bfloat162float(h_out[i]),
                       "mv_4b_lut8 output at index " + std::to_string(i), 1e-3f);
@@ -822,7 +914,7 @@ void test_mv() {
 
     // mv_4b_lut4
     {
-        auto qb = quantise_4b_linear(h_b, /*group_size*/ 64);
+        auto qb = host_quantise_linear(h_b, /*group_size*/ 64, 4);
 
         thrust::device_vector<bfloat16> d_a = h_a;
         thrust::device_vector<uint8_t> d_b = qb.data;
@@ -833,10 +925,48 @@ void test_mv() {
                        d_out.data().get(), k, n, qb.group_size);
         thrust::host_vector<bfloat16> h_out = d_out;
 
-        auto qexpected = host_mv(h_a, dequantise(qb), k, n);
+        auto qexpected = host_mv(h_a, host_dequantise(qb), k, n);
         for (int i = 0; i < n; i++) {
             expect_eq(__bfloat162float(qexpected[i]), __bfloat162float(h_out[i]),
                       "mv_4b_lut4 output at index " + std::to_string(i), 1e-3f);
+        }
+    }
+
+    // mv_4b_linear
+    {
+        auto qb = host_quantise_linear(h_b, /*group_size*/ 64, 4);
+
+        thrust::device_vector<bfloat16> d_a = h_a;
+        thrust::device_vector<uint8_t> d_b = qb.data;
+        thrust::device_vector<bfloat16> d_scale = qb.scale;
+        thrust::device_vector<bfloat16> d_out(n);
+        run_mv_4b_linear(d_a.data().get(), d_b.data().get(), d_scale.data().get(),
+                         d_out.data().get(), k, n, qb.group_size);
+        thrust::host_vector<bfloat16> h_out = d_out;
+
+        auto qexpected = host_mv(h_a, host_dequantise(qb), k, n);
+        for (int i = 0; i < n; i++) {
+            expect_eq(__bfloat162float(qexpected[i]), __bfloat162float(h_out[i]),
+                      "mv_4b_linear output at index " + std::to_string(i), 1e-3f);
+        }
+    }
+
+    // mv_binary
+    {
+        auto qb = host_quantise_linear(h_b, /*group_size*/ 64, 1);
+
+        thrust::device_vector<bfloat16> d_a = h_a;
+        thrust::device_vector<uint8_t> d_b = qb.data;
+        thrust::device_vector<bfloat16> d_scale = qb.scale;
+        thrust::device_vector<bfloat16> d_out(n);
+        run_mv_binary(d_a.data().get(), d_b.data().get(), d_scale.data().get(), d_out.data().get(),
+                      k, n, qb.group_size);
+        thrust::host_vector<bfloat16> h_out = d_out;
+
+        auto qexpected = host_mv(h_a, host_dequantise(qb), k, n);
+        for (int i = 0; i < n; i++) {
+            expect_eq(__bfloat162float(qexpected[i]), __bfloat162float(h_out[i]),
+                      "mv_binary output at index " + std::to_string(i), 1e-3f);
         }
     }
 }
@@ -1156,6 +1286,44 @@ void benchmark_mv(Log& log) {
             run_mv_4b_lut4(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 2),
                            d_lut.data().get(), d_scale.data().get() + idx * (n * k) / group_size,
                            d_out.data().get() + idx * n, k, n, group_size);
+        });
+    }
+
+    // mv_4b_linear
+    {
+        const int group_size = 64;
+        thrust::device_vector<bfloat16> d_a(copies * k, 1.125f);
+        thrust::device_vector<uint8_t> d_b(copies * n * (k / 2));
+        thrust::sequence(thrust::cuda::par.on(stream), d_b.begin(), d_b.end(), 0);
+        thrust::device_vector<bfloat16> d_scale(copies * (n * k) / group_size, 0.01f);
+        thrust::device_vector<bfloat16> d_out(copies * n);
+        auto bytes_read =
+            (k + n * k / group_size) * sizeof(bfloat16) + n * (k / 2) * sizeof(uint8_t);
+        auto bytes_write = n * sizeof(bfloat16);
+        run_benchmark("mv_4b_linear", bytes_read, bytes_write, [&](uint i) {
+            auto idx = i % copies;
+            run_mv_4b_linear(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 2),
+                             d_scale.data().get() + idx * (n * k) / group_size,
+                             d_out.data().get() + idx * n, k, n, group_size);
+        });
+    }
+
+    // mv_binary
+    {
+        const int group_size = 64;
+        thrust::device_vector<bfloat16> d_a(copies * k, 1.125f);
+        thrust::device_vector<uint8_t> d_b(copies * n * (k / 8));
+        thrust::sequence(thrust::cuda::par.on(stream), d_b.begin(), d_b.end(), 0);
+        thrust::device_vector<bfloat16> d_scale(copies * (n * k) / group_size, 0.01f);
+        thrust::device_vector<bfloat16> d_out(copies * n);
+        auto bytes_read =
+            (k + n * k / group_size) * sizeof(bfloat16) + n * (k / 8) * sizeof(uint8_t);
+        auto bytes_write = n * sizeof(bfloat16);
+        run_benchmark("mv_binary", bytes_read, bytes_write, [&](uint i) {
+            auto idx = i % copies;
+            run_mv_binary(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 8),
+                          d_scale.data().get() + idx * (n * k) / group_size,
+                          d_out.data().get() + idx * n, k, n, group_size);
         });
     }
 
