@@ -337,56 +337,6 @@ __global__ void kernel__copy_binary(const uint32_t* in,
 // --------------------------
 // Matrix-vector kernels
 
-__global__ void kernel__mv(const bfloat16* a,  // [k]
-                           const bfloat16* b,  // [k, n] (k-major)
-                           bfloat16* out,      // [n]
-                           int k,
-                           int n) {
-    extern __shared__ char _shared[];
-    auto shared = reinterpret_cast<float2*>(_shared);
-    const auto in2 = blockIdx.x * blockDim.x + threadIdx.x;
-    const auto a2 = reinterpret_cast<const bfloat162*>(a);
-    const auto b2 = reinterpret_cast<const bfloat162*>(b);
-    const auto out2 = reinterpret_cast<bfloat162*>(out);
-    if (in2 < n / 2) {
-        // Partial dot product for outputs n = [2*in2, 2*in2+1]
-        // with partial sums spread across threadIdx.y
-        float2 sum = {0.0f, 0.0f};
-        for (auto ik2 = threadIdx.y; ik2 < k / 2; ik2 += blockDim.y) {
-            auto a_ik = __bfloat1622float2(a2[ik2]);
-            auto b_ik0 = __bfloat1622float2(b2[(2 * ik2) * n / 2 + in2]);
-            auto b_ik1 = __bfloat1622float2(b2[(2 * ik2 + 1) * n / 2 + in2]);
-            sum.x = fmaf(a_ik.x, b_ik0.x, sum.x);  // n = 2*in2, k = 2*ik2
-            sum.x = fmaf(a_ik.y, b_ik1.x, sum.x);  // n = 2*in2, k = 2*ik2+1
-            sum.y = fmaf(a_ik.x, b_ik0.y, sum.y);  // n = 2*in2+1, k = 2*ik2
-            sum.y = fmaf(a_ik.y, b_ik1.y, sum.y);  // n = 2*in2+1, k = 2*ik2+1
-        }
-        // Reduce over threadIdx.y in shared memory
-        auto sbase = threadIdx.x * blockDim.y;
-        shared[sbase + threadIdx.y] = sum;
-        __syncthreads();
-        if (threadIdx.y == 0) {
-            // A linear reduction is fine - this isn't the bottleneck
-            for (auto i = 1u; i < blockDim.y; ++i) {
-                sum.x += shared[sbase + i].x;
-                sum.y += shared[sbase + i].y;
-            }
-            out2[in2] = __float22bfloat162_rn(sum);
-        }
-    }
-}
-
-void run_mv(const bfloat16* a, const bfloat16* b, bfloat16* out, int k, int n) {
-    if (n % 2 != 0 || k % 2 != 0) {
-        throw std::invalid_argument("kernel__mv requires n and k to be even");
-    }
-    dim3 blockDim(32, 32);  // [bn, bk]
-    dim3 gridDim((n + blockDim.x - 1) / (2 * blockDim.x), 1);
-    auto sharedBytes = blockDim.y * blockDim.x * sizeof(float2);
-    kernel__mv<<<gridDim, blockDim, sharedBytes>>>(a, b, out, k, n);
-    CHECK_CUDA(cudaGetLastError());
-}
-
 template <class T>
 __device__ T block_reduce(T value, T* shared) {
     // Reduce within a warp using shuffle
@@ -407,11 +357,11 @@ __device__ T block_reduce(T value, T* shared) {
     return value;
 }
 
-__global__ void kernel__mvT(const bfloat16* a,  // [k]
-                            const bfloat16* b,  // [n, k] (n-major)
-                            bfloat16* out,      // [n]
-                            int k,
-                            int n) {
+__global__ void kernel__mv(const bfloat16* a,  // [k]
+                           const bfloat16* b,  // [n, k] (n-major)
+                           bfloat16* out,      // [n]
+                           int k,
+                           int n) {
     extern __shared__ char _shared[];
     const auto a2 = reinterpret_cast<const bfloat162*>(a);
     const auto b2 = reinterpret_cast<const bfloat162*>(b);
@@ -430,13 +380,13 @@ __global__ void kernel__mvT(const bfloat16* a,  // [k]
     }
 }
 
-void run_mvT(const bfloat16* a, const bfloat16* b, bfloat16* out, int k, int n) {
+void run_mv(const bfloat16* a, const bfloat16* b, bfloat16* out, int k, int n) {
     if (k % 2 != 0) {
-        throw std::invalid_argument("kernel__mvT requires k to be even");
+        throw std::invalid_argument("kernel__mv requires k to be even");
     }
     auto blockSize = 512;
     auto sharedBytes = (blockSize / warp_size) * sizeof(float);
-    kernel__mvT<<<n, blockSize, sharedBytes>>>(a, b, out, k, n);
+    kernel__mv<<<n, blockSize, sharedBytes>>>(a, b, out, k, n);
     CHECK_CUDA(cudaGetLastError());
 }
 
@@ -619,15 +569,12 @@ void test_mv() {
         h_b[i] = __float2bfloat16(dist(rng));
     }
     thrust::host_vector<bfloat16> expected(n);
-    thrust::host_vector<bfloat16> expectedT(n);
     for (int j = 0; j < n; j++) {
-        float sum = 0.0f, sumT = 0.0f;
+        float sum = 0.0f;
         for (int i = 0; i < k; i++) {
-            sum += __bfloat162float(h_a[i]) * __bfloat162float(h_b[i * n + j]);
-            sumT += __bfloat162float(h_a[i]) * __bfloat162float(h_b[j * k + i]);
+            sum += __bfloat162float(h_a[i]) * __bfloat162float(h_b[j * k + i]);
         }
         expected[j] = __float2bfloat16(sum);
-        expectedT[j] = __float2bfloat16(sumT);
     }
 
     {
@@ -640,19 +587,6 @@ void test_mv() {
         for (int i = 0; i < n; i++) {
             expect_eq(__bfloat162float(expected[i]), __bfloat162float(h_out[i]),
                       "mv output at index " + std::to_string(i), 1e-3f);
-        }
-    }
-
-    {
-        thrust::device_vector<bfloat16> d_a = h_a;
-        thrust::device_vector<bfloat16> d_b = h_b;
-        thrust::device_vector<bfloat16> d_out(n);
-        run_mvT(d_a.data().get(), d_b.data().get(), d_out.data().get(), k, n);
-        thrust::host_vector<bfloat16> h_out = d_out;
-
-        for (int i = 0; i < n; i++) {
-            expect_eq(__bfloat162float(expectedT[i]), __bfloat162float(h_out[i]),
-                      "mvT output at index " + std::to_string(i), 1e-3f);
         }
     }
 }
@@ -920,24 +854,12 @@ void benchmark_mv(Log& log) {
     // mv
     {
         thrust::device_vector<bfloat16> d_a(copies * k, 1.5f);
-        thrust::device_vector<bfloat16> d_b(copies * k * n, 0.125f);
-        thrust::device_vector<bfloat16> d_out(copies * n);
-        run_benchmark("mv", (k + k * n) * sizeof(bfloat16), n * sizeof(bfloat16), [&](uint i) {
-            auto idx = i % copies;
-            run_mv(d_a.data().get() + idx * k, d_b.data().get() + idx * k * n,
-                   d_out.data().get() + idx * n, k, n);
-        });
-    }
-
-    // mvT
-    {
-        thrust::device_vector<bfloat16> d_a(copies * k, 1.5f);
         thrust::device_vector<bfloat16> d_b(copies * n * k, 0.125f);
         thrust::device_vector<bfloat16> d_out(copies * n);
-        run_benchmark("mvT", (k + n * k) * sizeof(bfloat16), n * sizeof(bfloat16), [&](uint i) {
+        run_benchmark("mv", (k + n * k) * sizeof(bfloat16), n * sizeof(bfloat16), [&](uint i) {
             auto idx = i % copies;
-            run_mvT(d_a.data().get() + idx * k, d_b.data().get() + idx * n * k,
-                    d_out.data().get() + idx * n, k, n);
+            run_mv(d_a.data().get() + idx * k, d_b.data().get() + idx * n * k,
+                   d_out.data().get() + idx * n, k, n);
         });
     }
 
