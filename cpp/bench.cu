@@ -357,61 +357,34 @@ __device__ T block_reduce(T value, T* shared) {
     return value;
 }
 
+// WeightT must implement:
+// - static constexpr int elements_per_load
+// - T load(uint index)
+// - bfloat162 get(T q, int i)  // called for i in [0, elements_per_load/2)
+//
+// ScaleT must implement:
+// - bfloat16 load(uint index)
+//
+template <class WeightT, class ScaleT>
 __global__ void kernel__mv(const bfloat16* a,  // [k]
-                           const bfloat16* b,  // [n, k] (n-major)
+                           WeightT b,          // [n, k/d, d]
+                           ScaleT b_scale,     // [n, d*(k/d)]
                            bfloat16* out,      // [n]
-                           int k,
-                           int n) {
+                           uint k) {           // multiple of d
+    constexpr auto d = WeightT::elements_per_load;
+    static_assert(d % 2 == 0, "WeightT::elements_per_load must be multiple of 2");
     extern __shared__ char _shared[];
     const auto a2 = reinterpret_cast<const bfloat162*>(a);
-    const auto b2 = reinterpret_cast<const bfloat162*>(b);
     const auto in = blockIdx.x;
     // Partial dot product with sums spread across threadIdx.x
     float sum = 0.0f;
-    for (auto ik2 = threadIdx.x; ik2 < k / 2; ik2 += blockDim.x) {
-        auto a_ik = __bfloat1622float2(a2[ik2]);
-        auto b_in = __bfloat1622float2(b2[in * k / 2 + ik2]);
-        sum = fmaf(a_ik.x, b_in.x, sum);  // n = in, k = 2*ik2
-        sum = fmaf(a_ik.y, b_in.y, sum);  // n = in, k = 2*ik2+1
-    }
-    sum = block_reduce(sum, reinterpret_cast<float*>(_shared));
-    if (threadIdx.x == 0) {
-        out[in] = __float2bfloat16_rn(sum);
-    }
-}
-
-void run_mv(const bfloat16* a, const bfloat16* b, bfloat16* out, int k, int n) {
-    if (k % 2 != 0) {
-        throw std::invalid_argument("kernel__mv requires k to be even");
-    }
-    auto blockSize = 512;
-    auto sharedBytes = (blockSize / warp_size) * sizeof(float);
-    kernel__mv<<<n, blockSize, sharedBytes>>>(a, b, out, k, n);
-    CHECK_CUDA(cudaGetLastError());
-}
-
-__global__ void kernel__mv_4b_lut8(const bfloat16* a,      // [k]
-                                   const uint8_t* b,       // [n, k] (n-major, 4-bit quantized)
-                                   const bfloat162* lut,   // [256]
-                                   const bfloat16* scale,  // [n, k/group_size] (n-major)
-                                   bfloat16* out,          // [n]
-                                   int k,                  // multiple of 8
-                                   int group_size) {       // multiple of 8
-    extern __shared__ char _shared[];
-    const auto a2 = reinterpret_cast<const bfloat162*>(a);
-    const auto bu = reinterpret_cast<const uint32_t*>(b);
-    constexpr auto bu_count = sizeof(*bu) * 8 / 4;  // number of 4-bit values in an element of bu
-    const auto in = blockIdx.x;
-    // Partial dot product with sums spread across threadIdx.x
-    float sum = 0.0f;
-    for (auto i = threadIdx.x; i < k / bu_count; i += blockDim.x) {
-        auto si = scale[in * (k / group_size) + (i * bu_count) / group_size];
-        auto bi = bu[in * (k / bu_count) + i];
+    for (auto i = threadIdx.x; i < k / d; i += blockDim.x) {
+        auto bi = b.load(in * (k / d) + i);
+        auto si = b_scale.load(in * k + i * d);
 #pragma unroll
-        for (int j = 0; j < bu_count / 2; j++) {
-            auto idx = (bi >> (8 * j)) & 0xFF;
-            auto aj = __bfloat1622float2(a2[i * (bu_count / 2) + j]);
-            auto bj = __bfloat1622float2(__ldg(&lut[idx]) * bfloat162{si, si});
+        for (int j = 0; j < d / 2; j++) {
+            auto aj = __bfloat1622float2(a2[i * (d / 2) + j]);
+            auto bj = __bfloat1622float2(b.get(bi, j) * bfloat162{si, si});
             sum = fmaf(aj.x, bj.x, sum);
             sum = fmaf(aj.y, bj.y, sum);
         }
@@ -422,21 +395,104 @@ __global__ void kernel__mv_4b_lut8(const bfloat16* a,      // [k]
     }
 }
 
+struct ScaleT_None {
+    __device__ __forceinline__ bfloat16 load(uint) const { return __float2bfloat16_rn(1); }
+};
+
+struct ScaleT_Grouped {
+    const bfloat16* data;
+    uint group_size;
+    __device__ __forceinline__ bfloat16 load(uint index) const { return data[index / group_size]; }
+};
+
+struct WeightT_Bfloat16 {
+    const bfloat16* data;
+    using load_type = uint64_t;
+    static constexpr int elements_per_load = sizeof(load_type) / sizeof(bfloat16);
+
+    __device__ __forceinline__ load_type load(uint index) const {
+        return reinterpret_cast<const load_type*>(data)[index];
+    }
+    __device__ __forceinline__ bfloat162 get(load_type q, int i) const {
+        return reinterpret_cast<const bfloat162*>(&q)[i];
+    }
+};
+
+struct WeightT_4b_LUT8 {
+    const uint8_t* data;
+    const bfloat162* lut;
+    using load_type = uint32_t;
+    static constexpr int elements_per_load = sizeof(load_type) * 8 / 4;
+
+    __device__ __forceinline__ load_type load(uint index) const {
+        return reinterpret_cast<const load_type*>(data)[index];
+    }
+    __device__ __forceinline__ bfloat162 get(load_type q, int i) const {
+        auto idx = (q >> (8 * i)) & 0xFF;
+        return __ldg(&lut[idx]);
+    }
+};
+
+struct WeightT_4b_LUT4 {
+    const uint8_t* data;
+    const bfloat16* lut;
+    using load_type = uint32_t;
+    static constexpr int elements_per_load = sizeof(load_type) * 8 / 4;
+
+    __device__ __forceinline__ load_type load(uint index) const {
+        return reinterpret_cast<const load_type*>(data)[index];
+    }
+    __device__ __forceinline__ bfloat162 get(load_type q, int i) const {
+        auto idx0 = (q >> (8 * i + 4)) & 0x0F;
+        auto idx1 = (q >> (8 * i)) & 0x0F;
+        return bfloat162(__ldg(&lut[idx0]), __ldg(&lut[idx1]));
+    }
+};
+
+template <class WeightT, class ScaleT>
+void template_run_mv(const bfloat16* a, WeightT b, ScaleT scale, bfloat16* out, uint k, uint n) {
+    if (k % WeightT::elements_per_load != 0) {
+        std::ostringstream oss;
+        oss << "mv requires k (" << k << ") to be a multiple of WeightT::elements_per_load ("
+            << WeightT::elements_per_load << ")";
+        throw std::invalid_argument(oss.str());
+    }
+    auto blockSize = 512;
+    auto sharedBytes = (blockSize / warp_size) * sizeof(float);
+    kernel__mv<<<n, blockSize, sharedBytes>>>(a, b, scale, out, k);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+void run_mv(const bfloat16* a, const bfloat16* b, bfloat16* out, uint k, uint n) {
+    template_run_mv(a, WeightT_Bfloat16{b}, ScaleT_None{}, out, k, n);
+}
+
 void run_mv_4b_lut8(const bfloat16* a,
                     const uint8_t* b,
                     const bfloat162* lut,
                     const bfloat16* scale,
                     bfloat16* out,
-                    int k,
-                    int n,
-                    int group_size) {
-    if (k % 8 != 0 || group_size % 8 != 0) {
-        throw std::invalid_argument("kernel__mv requires {k, group_size} to be a multiple of 8");
+                    uint k,
+                    uint n,
+                    uint group_size) {
+    if (group_size % 8 != 0) {
+        throw std::invalid_argument("mv_4b_lut8 requires group_size to be a multiple of 8");
     }
-    auto blockSize = 256;
-    auto sharedBytes = (blockSize / warp_size) * sizeof(float);
-    kernel__mv_4b_lut8<<<n, blockSize, sharedBytes>>>(a, b, lut, scale, out, k, group_size);
-    CHECK_CUDA(cudaGetLastError());
+    template_run_mv(a, WeightT_4b_LUT8{b, lut}, ScaleT_Grouped{scale, group_size}, out, k, n);
+}
+
+void run_mv_4b_lut4(const bfloat16* a,
+                    const uint8_t* b,
+                    const bfloat16* lut,
+                    const bfloat16* scale,
+                    bfloat16* out,
+                    uint k,
+                    uint n,
+                    uint group_size) {
+    if (group_size % 8 != 0) {
+        throw std::invalid_argument("mv_4b_lut4 requires group_size to be a multiple of 8");
+    }
+    template_run_mv(a, WeightT_4b_LUT4{b, lut}, ScaleT_Grouped{scale, group_size}, out, k, n);
 }
 
 // --------------------------
@@ -742,8 +798,6 @@ void test_mv() {
             expect_eq(__bfloat162float(expected[i]), __bfloat162float(h_out[i]),
                       "mv output at index " + std::to_string(i), 1e-3f);
         }
-        double norm = rmse_norm(expected, h_out);
-        std::cerr << "mv RMSEn: " << norm << std::endl;
     }
 
     // mv_4b_lut8
@@ -763,6 +817,26 @@ void test_mv() {
         for (int i = 0; i < n; i++) {
             expect_eq(__bfloat162float(qexpected[i]), __bfloat162float(h_out[i]),
                       "mv_4b_lut8 output at index " + std::to_string(i), 1e-3f);
+        }
+    }
+
+    // mv_4b_lut4
+    {
+        auto qb = quantise_4b_linear(h_b, /*group_size*/ 64);
+
+        thrust::device_vector<bfloat16> d_a = h_a;
+        thrust::device_vector<uint8_t> d_b = qb.data;
+        thrust::device_vector<bfloat16> d_scale = qb.scale;
+        thrust::device_vector<bfloat16> d_lut = qb.lut;
+        thrust::device_vector<bfloat16> d_out(n);
+        run_mv_4b_lut4(d_a.data().get(), d_b.data().get(), d_lut.data().get(), d_scale.data().get(),
+                       d_out.data().get(), k, n, qb.group_size);
+        thrust::host_vector<bfloat16> h_out = d_out;
+
+        auto qexpected = host_mv(h_a, dequantise(qb), k, n);
+        for (int i = 0; i < n; i++) {
+            expect_eq(__bfloat162float(qexpected[i]), __bfloat162float(h_out[i]),
+                      "mv_4b_lut4 output at index " + std::to_string(i), 1e-3f);
         }
     }
 }
@@ -1057,6 +1131,29 @@ void benchmark_mv(Log& log) {
         run_benchmark("mv_4b_lut8", bytes_read, bytes_write, [&](uint i) {
             auto idx = i % copies;
             run_mv_4b_lut8(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 2),
+                           d_lut.data().get(), d_scale.data().get() + idx * (n * k) / group_size,
+                           d_out.data().get() + idx * n, k, n, group_size);
+        });
+    }
+
+    // mv_4b_lut4
+    {
+        const int group_size = 64;
+        thrust::device_vector<bfloat16> d_a(copies * k, 1.125f);
+        thrust::device_vector<uint8_t> d_b(copies * n * (k / 2));
+        thrust::sequence(thrust::cuda::par.on(stream), d_b.begin(), d_b.end(), 0);
+        thrust::device_vector<bfloat16> d_lut(16);
+        for (int i = 0; i < 16; i++) {
+            d_lut[i] = __float2bfloat16_rn(i - 8);
+        }
+        thrust::device_vector<bfloat16> d_scale(copies * (n * k) / group_size, 0.01f);
+        thrust::device_vector<bfloat16> d_out(copies * n);
+        auto bytes_read =
+            (k + n * k / group_size) * sizeof(bfloat16) + n * (k / 2) * sizeof(uint8_t);
+        auto bytes_write = n * sizeof(bfloat16);
+        run_benchmark("mv_4b_lut4", bytes_read, bytes_write, [&](uint i) {
+            auto idx = i % copies;
+            run_mv_4b_lut4(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 2),
                            d_lut.data().get(), d_scale.data().get() + idx * (n * k) / group_size,
                            d_out.data().get() + idx * n, k, n, group_size);
         });
