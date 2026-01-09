@@ -479,7 +479,7 @@ struct WeightT_4b_Linear {
     }
 };
 
-struct WeightT_Binary {
+struct WeightT_1b {
     const uint8_t* data;
     using load_type = uint16_t;
     static constexpr int elements_per_load = sizeof(load_type) * 8;
@@ -496,6 +496,48 @@ struct WeightT_Binary {
         reinterpret_cast<uint32_t&>(r) ^= c;  // flip sign bit
         return r;
     }
+};
+
+template <class T, uint N>
+struct DeviceArray {
+    T data[N];
+    static constexpr uint size() { return N; }
+    __host__ __device__ __forceinline__ const T& operator[](uint index) const {
+        return data[index];
+    }
+    __host__ __device__ __forceinline__ T& operator[](uint index) { return data[index]; }
+};
+
+struct WeightT_1b_LUT {
+    using raw_load_type = uint8_t;
+    static constexpr uint lookup_bits = 4;
+    using ldg_lut_type = uint64_t;
+
+    static constexpr int elements_per_load = sizeof(raw_load_type) * 8;
+    using load_type = DeviceArray<bfloat162, elements_per_load / 2>;
+    using lut_type = DeviceArray<bfloat162, lookup_bits / 2>;
+    static_assert(sizeof(lut_type) == sizeof(ldg_lut_type), "lut_type size mismatch");
+
+    const uint8_t* data;
+    const lut_type* lut;
+
+    __device__ __forceinline__ load_type load(uint index) const {
+        auto raw_value = reinterpret_cast<const raw_load_type*>(data)[index];
+        load_type result;
+#pragma unroll
+        for (int i = 0; i < elements_per_load / lookup_bits; i++) {
+            auto lut_mask = (1 << lookup_bits) - 1;
+            auto lut_idx = (raw_value >> (lookup_bits * i)) & lut_mask;
+            auto lut_value =
+                reinterpret<lut_type>(__ldg(&reinterpret_cast<const ldg_lut_type*>(lut)[lut_idx]));
+#pragma unroll
+            for (int j = 0; j < lookup_bits / 2; j++) {
+                result[i * (lookup_bits / 2) + j] = lut_value[j];
+            }
+        }
+        return result;
+    }
+    __device__ __forceinline__ bfloat162 get(load_type q, int i) const { return q[i]; }
 };
 
 template <class WeightT, class ScaleT>
@@ -559,17 +601,31 @@ void run_mv_4b_linear(const bfloat16* a,
     template_run_mv(a, WeightT_4b_Linear{b}, ScaleT_Grouped{scale, group_size}, out, k, n);
 }
 
-void run_mv_binary(const bfloat16* a,
+void run_mv_1b(const bfloat16* a,
+               const uint8_t* b,
+               const bfloat16* scale,
+               bfloat16* out,
+               uint k,
+               uint n,
+               uint group_size) {
+    if (group_size % 32 != 0) {
+        throw std::invalid_argument("mv_1b requires group_size to be a multiple of 32");
+    }
+    template_run_mv(a, WeightT_1b{b}, ScaleT_Grouped{scale, group_size}, out, k, n);
+}
+
+void run_mv_1b_lut(const bfloat16* a,
                    const uint8_t* b,
+                   const DeviceArray<bfloat162, 2>* lut,
                    const bfloat16* scale,
                    bfloat16* out,
                    uint k,
                    uint n,
                    uint group_size) {
-    if (group_size % 32 != 0) {
-        throw std::invalid_argument("mv_binary requires group_size to be a multiple of 32");
+    if (group_size % 8 != 0) {
+        throw std::invalid_argument("mv_1b_lut requires group_size to be a multiple of 8");
     }
-    template_run_mv(a, WeightT_Binary{b}, ScaleT_Grouped{scale, group_size}, out, k, n);
+    template_run_mv(a, WeightT_1b_LUT{b, lut}, ScaleT_Grouped{scale, group_size}, out, k, n);
 }
 
 // --------------------------
@@ -744,12 +800,20 @@ struct ScaledTensor {
     size_t group_size;
     size_t bits_per_element;
 
-    thrust::host_vector<bfloat162> lut8() const {
-        thrust::host_vector<bfloat162> h_lut8(256);
-        for (int i = 0; i < 256; i++) {
-            h_lut8[i] = bfloat162(lut[i % 16], lut[i / 16]);
+    // A N*B-bit LUT, mapping indices [0, 2^(N*B)-1) -> (N/2) x bfloat162
+    template <int N>
+    thrust::host_vector<DeviceArray<bfloat162, N / 2>> lutN() const {
+        static_assert(N >= 2, "N must be at least 2");
+        const auto entries = 1 << (N * bits_per_element);
+        const auto lut_mask = (1 << bits_per_element) - 1;
+        thrust::host_vector<DeviceArray<bfloat162, N / 2>> h_out(entries);
+        for (uint i = 0; i < h_out.size(); i++) {
+            for (int j = 0; j < N / 2; j++) {
+                h_out[i][j] = bfloat162(lut[(i >> (2 * j * bits_per_element)) & lut_mask],
+                                        lut[(i >> ((2 * j + 1) * bits_per_element)) & lut_mask]);
+            }
         }
-        return h_lut8;
+        return h_out;
     }
 };
 
@@ -898,8 +962,11 @@ void test_mv() {
 
         thrust::device_vector<bfloat16> d_a = h_a;
         thrust::device_vector<uint8_t> d_b = qb.data;
+        auto h_lut = qb.lutN<2>();
+        thrust::device_vector<bfloat162> d_lut(
+            reinterpret_cast<const bfloat162*>(h_lut.data()),
+            reinterpret_cast<const bfloat162*>(h_lut.data() + h_lut.size()));
         thrust::device_vector<bfloat16> d_scale = qb.scale;
-        thrust::device_vector<bfloat162> d_lut = qb.lut8();
         thrust::device_vector<bfloat16> d_out(n);
         run_mv_4b_lut8(d_a.data().get(), d_b.data().get(), d_lut.data().get(), d_scale.data().get(),
                        d_out.data().get(), k, n, qb.group_size);
@@ -918,8 +985,8 @@ void test_mv() {
 
         thrust::device_vector<bfloat16> d_a = h_a;
         thrust::device_vector<uint8_t> d_b = qb.data;
-        thrust::device_vector<bfloat16> d_scale = qb.scale;
         thrust::device_vector<bfloat16> d_lut = qb.lut;
+        thrust::device_vector<bfloat16> d_scale = qb.scale;
         thrust::device_vector<bfloat16> d_out(n);
         run_mv_4b_lut4(d_a.data().get(), d_b.data().get(), d_lut.data().get(), d_scale.data().get(),
                        d_out.data().get(), k, n, qb.group_size);
@@ -951,7 +1018,7 @@ void test_mv() {
         }
     }
 
-    // mv_binary
+    // mv_1b
     {
         auto qb = host_quantise_linear(h_b, /*group_size*/ 64, 1);
 
@@ -959,15 +1026,49 @@ void test_mv() {
         thrust::device_vector<uint8_t> d_b = qb.data;
         thrust::device_vector<bfloat16> d_scale = qb.scale;
         thrust::device_vector<bfloat16> d_out(n);
-        run_mv_binary(d_a.data().get(), d_b.data().get(), d_scale.data().get(), d_out.data().get(),
-                      k, n, qb.group_size);
+        run_mv_1b(d_a.data().get(), d_b.data().get(), d_scale.data().get(), d_out.data().get(), k,
+                  n, qb.group_size);
         thrust::host_vector<bfloat16> h_out = d_out;
 
         auto qexpected = host_mv(h_a, host_dequantise(qb), k, n);
         for (int i = 0; i < n; i++) {
             expect_eq(__bfloat162float(qexpected[i]), __bfloat162float(h_out[i]),
-                      "mv_binary output at index " + std::to_string(i), 1e-3f);
+                      "mv_1b output at index " + std::to_string(i), 1e-3f);
         }
+    }
+
+    // mv_1b_lut
+    {
+        auto qb = host_quantise_linear(h_b, /*group_size*/ 64, 1);
+
+        thrust::device_vector<bfloat16> d_a = h_a;
+        thrust::device_vector<uint8_t> d_b = qb.data;
+        thrust::device_vector<DeviceArray<bfloat162, 2>> d_lut(qb.lutN<4>());
+        thrust::device_vector<bfloat16> d_scale = qb.scale;
+        thrust::device_vector<bfloat16> d_out(n);
+        run_mv_1b_lut(d_a.data().get(), d_b.data().get(), d_lut.data().get(), d_scale.data().get(),
+                      d_out.data().get(), k, n, qb.group_size);
+        thrust::host_vector<bfloat16> h_out = d_out;
+
+        auto qexpected = host_mv(h_a, host_dequantise(qb), k, n);
+        for (int i = 0; i < n; i++) {
+            expect_eq(__bfloat162float(qexpected[i]), __bfloat162float(h_out[i]),
+                      "mv_1b output at index " + std::to_string(i), 1e-3f);
+        }
+
+        // for (size_t i = 0; i < qb.lut.size(); i++) {
+        //     std::cout << "lut[" << i << "] = " << __bfloat162float(qb.lut[i]) << std::endl;
+        // }
+        // auto lut = qb.lutN<4>();
+        // std::cout << std::endl;
+        // for (size_t i = 0; i < lut.size(); i++) {
+        //     std::cout << "lutN[" << i << "] = ";
+        //     for (size_t j = 0; j < lut[i].size(); j++) {
+        //         auto v = lut[i][j];
+        //         std::cout << __bfloat162float(v.x) << ", " << __bfloat162float(v.y) << ", ";
+        //     }
+        //     std::cout << std::endl;
+        // }
     }
 }
 
@@ -1308,7 +1409,7 @@ void benchmark_mv(Log& log) {
         });
     }
 
-    // mv_binary
+    // mv_1b
     {
         const int group_size = 64;
         thrust::device_vector<bfloat16> d_a(copies * k, 1.125f);
@@ -1319,10 +1420,30 @@ void benchmark_mv(Log& log) {
         auto bytes_read =
             (k + n * k / group_size) * sizeof(bfloat16) + n * (k / 8) * sizeof(uint8_t);
         auto bytes_write = n * sizeof(bfloat16);
-        run_benchmark("mv_binary", bytes_read, bytes_write, [&](uint i) {
+        run_benchmark("mv_1b", bytes_read, bytes_write, [&](uint i) {
             auto idx = i % copies;
-            run_mv_binary(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 8),
-                          d_scale.data().get() + idx * (n * k) / group_size,
+            run_mv_1b(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 8),
+                      d_scale.data().get() + idx * (n * k) / group_size,
+                      d_out.data().get() + idx * n, k, n, group_size);
+        });
+    }
+
+    // mv_1b_lut
+    {
+        const int group_size = 64;
+        thrust::device_vector<bfloat16> d_a(copies * k, 1.125f);
+        thrust::device_vector<uint8_t> d_b(copies * n * (k / 8));
+        thrust::sequence(thrust::cuda::par.on(stream), d_b.begin(), d_b.end(), 0);
+        thrust::device_vector<DeviceArray<bfloat162, 2>> d_lut(16);  // TODO: fill nonzero
+        thrust::device_vector<bfloat16> d_scale(copies * (n * k) / group_size, 0.01f);
+        thrust::device_vector<bfloat16> d_out(copies * n);
+        auto bytes_read =
+            (k + n * k / group_size) * sizeof(bfloat16) + n * (k / 8) * sizeof(uint8_t);
+        auto bytes_write = n * sizeof(bfloat16);
+        run_benchmark("mv_1b_lut", bytes_read, bytes_write, [&](uint i) {
+            auto idx = i % copies;
+            run_mv_1b_lut(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 8),
+                          d_lut.data().get(), d_scale.data().get() + idx * (n * k) / group_size,
                           d_out.data().get() + idx * n, k, n, group_size);
         });
     }
