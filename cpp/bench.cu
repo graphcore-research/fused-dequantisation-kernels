@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <regex>
 #include <sstream>
@@ -541,7 +542,13 @@ struct WeightT_1b_LUT {
 };
 
 template <class WeightT, class ScaleT>
-void template_run_mv(const bfloat16* a, WeightT b, ScaleT scale, bfloat16* out, uint k, uint n) {
+void template_run_mv(const bfloat16* a,
+                     WeightT b,
+                     ScaleT scale,
+                     bfloat16* out,
+                     uint k,
+                     uint n,
+                     cudaStream_t stream) {
     if (k % WeightT::elements_per_load != 0) {
         std::ostringstream oss;
         oss << "mv requires k (" << k << ") to be a multiple of WeightT::elements_per_load ("
@@ -552,12 +559,17 @@ void template_run_mv(const bfloat16* a, WeightT b, ScaleT scale, bfloat16* out, 
     auto blockSize =
         std::clamp((k / 2 / WeightT::elements_per_load / warp_size) * warp_size, warp_size, 1024u);
     auto sharedBytes = (blockSize / warp_size) * sizeof(float);
-    kernel__mv<<<n, blockSize, sharedBytes>>>(a, b, scale, out, k);
+    kernel__mv<<<n, blockSize, sharedBytes, stream>>>(a, b, scale, out, k);
     CHECK_CUDA(cudaGetLastError());
 }
 
-void run_mv(const bfloat16* a, const bfloat16* b, bfloat16* out, uint k, uint n) {
-    template_run_mv(a, WeightT_Bfloat16{b}, ScaleT_None{}, out, k, n);
+void run_mv(const bfloat16* a,
+            const bfloat16* b,
+            bfloat16* out,
+            uint k,
+            uint n,
+            cudaStream_t stream) {
+    template_run_mv(a, WeightT_Bfloat16{b}, ScaleT_None{}, out, k, n, stream);
 }
 
 void run_mv_4b_lut8(const bfloat16* a,
@@ -567,11 +579,13 @@ void run_mv_4b_lut8(const bfloat16* a,
                     bfloat16* out,
                     uint k,
                     uint n,
-                    uint group_size) {
+                    uint group_size,
+                    cudaStream_t stream) {
     if (group_size % 8 != 0) {
         throw std::invalid_argument("mv_4b_lut8 requires group_size to be a multiple of 8");
     }
-    template_run_mv(a, WeightT_4b_LUT8{b, lut}, ScaleT_Grouped{scale, group_size}, out, k, n);
+    template_run_mv(a, WeightT_4b_LUT8{b, lut}, ScaleT_Grouped{scale, group_size}, out, k, n,
+                    stream);
 }
 
 void run_mv_4b_lut4(const bfloat16* a,
@@ -581,11 +595,13 @@ void run_mv_4b_lut4(const bfloat16* a,
                     bfloat16* out,
                     uint k,
                     uint n,
-                    uint group_size) {
+                    uint group_size,
+                    cudaStream_t stream) {
     if (group_size % 8 != 0) {
         throw std::invalid_argument("mv_4b_lut4 requires group_size to be a multiple of 8");
     }
-    template_run_mv(a, WeightT_4b_LUT4{b, lut}, ScaleT_Grouped{scale, group_size}, out, k, n);
+    template_run_mv(a, WeightT_4b_LUT4{b, lut}, ScaleT_Grouped{scale, group_size}, out, k, n,
+                    stream);
 }
 
 void run_mv_4b_linear(const bfloat16* a,
@@ -594,11 +610,12 @@ void run_mv_4b_linear(const bfloat16* a,
                       bfloat16* out,
                       uint k,
                       uint n,
-                      uint group_size) {
+                      uint group_size,
+                      cudaStream_t stream) {
     if (group_size % 8 != 0) {
         throw std::invalid_argument("mv_4b_linear requires group_size to be a multiple of 8");
     }
-    template_run_mv(a, WeightT_4b_Linear{b}, ScaleT_Grouped{scale, group_size}, out, k, n);
+    template_run_mv(a, WeightT_4b_Linear{b}, ScaleT_Grouped{scale, group_size}, out, k, n, stream);
 }
 
 void run_mv_1b(const bfloat16* a,
@@ -607,11 +624,12 @@ void run_mv_1b(const bfloat16* a,
                bfloat16* out,
                uint k,
                uint n,
-               uint group_size) {
+               uint group_size,
+               cudaStream_t stream) {
     if (group_size % 32 != 0) {
         throw std::invalid_argument("mv_1b requires group_size to be a multiple of 32");
     }
-    template_run_mv(a, WeightT_1b{b}, ScaleT_Grouped{scale, group_size}, out, k, n);
+    template_run_mv(a, WeightT_1b{b}, ScaleT_Grouped{scale, group_size}, out, k, n, stream);
 }
 
 void run_mv_1b_lut(const bfloat16* a,
@@ -621,11 +639,13 @@ void run_mv_1b_lut(const bfloat16* a,
                    bfloat16* out,
                    uint k,
                    uint n,
-                   uint group_size) {
+                   uint group_size,
+                   cudaStream_t stream) {
     if (group_size % 8 != 0) {
         throw std::invalid_argument("mv_1b_lut requires group_size to be a multiple of 8");
     }
-    template_run_mv(a, WeightT_1b_LUT{b, lut}, ScaleT_Grouped{scale, group_size}, out, k, n);
+    template_run_mv(a, WeightT_1b_LUT{b, lut}, ScaleT_Grouped{scale, group_size}, out, k, n,
+                    stream);
 }
 
 // --------------------------
@@ -941,13 +961,14 @@ void test_mv() {
     thrust::host_vector<bfloat16> h_a = randn(k);
     thrust::host_vector<bfloat16> h_b = randn(k * n);
     thrust::host_vector<bfloat16> expected = host_mv(h_a, h_b, k, n);
+    cudaStream_t stream = 0;
 
     // mv
     {
         thrust::device_vector<bfloat16> d_a = h_a;
         thrust::device_vector<bfloat16> d_b = h_b;
         thrust::device_vector<bfloat16> d_out(n);
-        run_mv(d_a.data().get(), d_b.data().get(), d_out.data().get(), k, n);
+        run_mv(d_a.data().get(), d_b.data().get(), d_out.data().get(), k, n, stream);
         thrust::host_vector<bfloat16> h_out = d_out;
 
         for (int i = 0; i < n; i++) {
@@ -969,7 +990,7 @@ void test_mv() {
         thrust::device_vector<bfloat16> d_scale = qb.scale;
         thrust::device_vector<bfloat16> d_out(n);
         run_mv_4b_lut8(d_a.data().get(), d_b.data().get(), d_lut.data().get(), d_scale.data().get(),
-                       d_out.data().get(), k, n, qb.group_size);
+                       d_out.data().get(), k, n, qb.group_size, stream);
         thrust::host_vector<bfloat16> h_out = d_out;
 
         auto qexpected = host_mv(h_a, host_dequantise(qb), k, n);
@@ -989,7 +1010,7 @@ void test_mv() {
         thrust::device_vector<bfloat16> d_scale = qb.scale;
         thrust::device_vector<bfloat16> d_out(n);
         run_mv_4b_lut4(d_a.data().get(), d_b.data().get(), d_lut.data().get(), d_scale.data().get(),
-                       d_out.data().get(), k, n, qb.group_size);
+                       d_out.data().get(), k, n, qb.group_size, stream);
         thrust::host_vector<bfloat16> h_out = d_out;
 
         auto qexpected = host_mv(h_a, host_dequantise(qb), k, n);
@@ -1008,7 +1029,7 @@ void test_mv() {
         thrust::device_vector<bfloat16> d_scale = qb.scale;
         thrust::device_vector<bfloat16> d_out(n);
         run_mv_4b_linear(d_a.data().get(), d_b.data().get(), d_scale.data().get(),
-                         d_out.data().get(), k, n, qb.group_size);
+                         d_out.data().get(), k, n, qb.group_size, stream);
         thrust::host_vector<bfloat16> h_out = d_out;
 
         auto qexpected = host_mv(h_a, host_dequantise(qb), k, n);
@@ -1027,7 +1048,7 @@ void test_mv() {
         thrust::device_vector<bfloat16> d_scale = qb.scale;
         thrust::device_vector<bfloat16> d_out(n);
         run_mv_1b(d_a.data().get(), d_b.data().get(), d_scale.data().get(), d_out.data().get(), k,
-                  n, qb.group_size);
+                  n, qb.group_size, stream);
         thrust::host_vector<bfloat16> h_out = d_out;
 
         auto qexpected = host_mv(h_a, host_dequantise(qb), k, n);
@@ -1047,7 +1068,7 @@ void test_mv() {
         thrust::device_vector<bfloat16> d_scale = qb.scale;
         thrust::device_vector<bfloat16> d_out(n);
         run_mv_1b_lut(d_a.data().get(), d_b.data().get(), d_lut.data().get(), d_scale.data().get(),
-                      d_out.data().get(), k, n, qb.group_size);
+                      d_out.data().get(), k, n, qb.group_size, stream);
         thrust::host_vector<bfloat16> h_out = d_out;
 
         auto qexpected = host_mv(h_a, host_dequantise(qb), k, n);
@@ -1055,20 +1076,6 @@ void test_mv() {
             expect_eq(__bfloat162float(qexpected[i]), __bfloat162float(h_out[i]),
                       "mv_1b output at index " + std::to_string(i), 1e-3f);
         }
-
-        // for (size_t i = 0; i < qb.lut.size(); i++) {
-        //     std::cout << "lut[" << i << "] = " << __bfloat162float(qb.lut[i]) << std::endl;
-        // }
-        // auto lut = qb.lutN<4>();
-        // std::cout << std::endl;
-        // for (size_t i = 0; i < lut.size(); i++) {
-        //     std::cout << "lutN[" << i << "] = ";
-        //     for (size_t j = 0; j < lut[i].size(); j++) {
-        //         auto v = lut[i][j];
-        //         std::cout << __bfloat162float(v.x) << ", " << __bfloat162float(v.y) << ", ";
-        //     }
-        //     std::cout << std::endl;
-        // }
     }
 }
 
@@ -1076,19 +1083,24 @@ void test_mv() {
 // Benchmarking
 
 double measure_time(uint reps, cudaStream_t stream, const std::function<void(uint)>& fn) {
+    cudaGraph_t graph;
+    cudaGraphExec_t graphExec;
+
+    CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     for (uint i = 0; i < reps; i++) {
         fn(i);
     }
+    CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
+    CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
     CHECK_CUDA(cudaStreamSynchronize(stream));
 
+    // timing
     cudaEvent_t start, end;
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&end));
 
     CHECK_CUDA(cudaEventRecord(start, stream));
-    for (uint i = 0; i < reps; i++) {
-        fn(i);
-    }
+    CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
     CHECK_CUDA(cudaEventRecord(end, stream));
     CHECK_CUDA(cudaEventSynchronize(end));
 
@@ -1096,15 +1108,15 @@ double measure_time(uint reps, cudaStream_t stream, const std::function<void(uin
     CHECK_CUDA(cudaEventElapsedTime(&time_ms, start, end));
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(end));
+    CHECK_CUDA(cudaGraphDestroy(graph));
+    CHECK_CUDA(cudaGraphExecDestroy(graphExec));
 
     return time_ms * 1e-3 / reps;
 }
 
-void benchmark_conversions(Log& log) {
+void benchmark_conversions(Log& log, const std::regex& pattern, const uint reps) {
     constexpr size_t bytes = 4 * (1ull << 30);
     static_assert(bytes % 16 == 0, "bytes must be a multiple of 16 for uint4 fill");
-    const uint reps = 10;
-    std::regex pattern("^(.*)$");
 
     Stream stream;
     thrust::device_vector<uint8_t> d_a(bytes);
@@ -1120,7 +1132,7 @@ void benchmark_conversions(Log& log) {
         double avg_time = measure_time(reps, stream, fn);
         std::ostringstream time_str, bw_str;
         time_str << std::fixed << std::setprecision(2) << (avg_time * 1e3) << " ms";
-        bw_str << std::fixed << std::setprecision(2)
+        bw_str << std::fixed << std::setprecision(1)
                << ((bytes_read + bytes_write) / avg_time) / 1e9 << " GB/s";
         std::cerr << std::setw(18) << std::left << name << "  " << std::setw(12) << std::right
                   << time_str.str() << "  " << std::setw(12) << std::right << bw_str.str()
@@ -1269,20 +1281,21 @@ void benchmark_conversions(Log& log) {
     std::cerr << std::endl;
 }
 
-void benchmark_mv(Log& log) {
-    const int k = 8192;
-    const int n = 4096;
-    const int reps = 100;
-    const int copies = 10;  // cycle through separate args to avoid cache hits
+void benchmark_mv(Log& log, const std::regex& pattern, const size_t reps, const size_t k) {
+    const size_t n = 4096;
+    const size_t copies = 100;  // cycle through separate args to avoid cache hits
 
     Stream stream;
 
     auto run_benchmark = [&](const std::string& name, size_t bytes_read, size_t bytes_write,
                              const std::function<void(uint)>& fn) {
+        if (!std::regex_match(name, pattern)) {
+            return;
+        }
         double avg_time = measure_time(reps, stream, fn);
         std::ostringstream time_str, bw_str;
-        time_str << std::fixed << std::setprecision(2) << (avg_time * 1e6) << " us";
-        bw_str << std::fixed << std::setprecision(2)
+        time_str << std::fixed << std::setprecision(1) << (avg_time * 1e6) << " us";
+        bw_str << std::fixed << std::setprecision(1)
                << ((bytes_read + bytes_write) / avg_time) / 1e9 << " GB/s";
         std::cerr << std::setw(18) << std::left << name << "  " << std::setw(12) << std::right
                   << time_str.str() << "  " << std::setw(12) << std::right << bw_str.str()
@@ -1340,7 +1353,7 @@ void benchmark_mv(Log& log) {
         run_benchmark("mv", (k + n * k) * sizeof(bfloat16), n * sizeof(bfloat16), [&](uint i) {
             auto idx = i % copies;
             run_mv(d_a.data().get() + idx * k, d_b.data().get() + idx * n * k,
-                   d_out.data().get() + idx * n, k, n);
+                   d_out.data().get() + idx * n, k, n, stream);
         });
     }
 
@@ -1363,7 +1376,7 @@ void benchmark_mv(Log& log) {
             auto idx = i % copies;
             run_mv_4b_lut8(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 2),
                            d_lut.data().get(), d_scale.data().get() + idx * (n * k) / group_size,
-                           d_out.data().get() + idx * n, k, n, group_size);
+                           d_out.data().get() + idx * n, k, n, group_size, stream);
         });
     }
 
@@ -1386,7 +1399,7 @@ void benchmark_mv(Log& log) {
             auto idx = i % copies;
             run_mv_4b_lut4(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 2),
                            d_lut.data().get(), d_scale.data().get() + idx * (n * k) / group_size,
-                           d_out.data().get() + idx * n, k, n, group_size);
+                           d_out.data().get() + idx * n, k, n, group_size, stream);
         });
     }
 
@@ -1405,7 +1418,7 @@ void benchmark_mv(Log& log) {
             auto idx = i % copies;
             run_mv_4b_linear(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 2),
                              d_scale.data().get() + idx * (n * k) / group_size,
-                             d_out.data().get() + idx * n, k, n, group_size);
+                             d_out.data().get() + idx * n, k, n, group_size, stream);
         });
     }
 
@@ -1424,7 +1437,7 @@ void benchmark_mv(Log& log) {
             auto idx = i % copies;
             run_mv_1b(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 8),
                       d_scale.data().get() + idx * (n * k) / group_size,
-                      d_out.data().get() + idx * n, k, n, group_size);
+                      d_out.data().get() + idx * n, k, n, group_size, stream);
         });
     }
 
@@ -1444,7 +1457,7 @@ void benchmark_mv(Log& log) {
             auto idx = i % copies;
             run_mv_1b_lut(d_a.data().get() + idx * k, d_b.data().get() + idx * n * (k / 8),
                           d_lut.data().get(), d_scale.data().get() + idx * (n * k) / group_size,
-                          d_out.data().get() + idx * n, k, n, group_size);
+                          d_out.data().get() + idx * n, k, n, group_size, stream);
         });
     }
 
@@ -1454,32 +1467,48 @@ void benchmark_mv(Log& log) {
 // --------------------------
 // Driver program
 
-int main() {
+int main(int argc, char** argv) {
     auto device_name = get_device_name();
     auto cuda_version = get_cuda_version();
     std::cerr << "Using device: " << device_name << std::endl;
     std::cerr << "CUDA version: " << cuda_version << std::endl;
     std::cerr << std::endl;
 
-    // Tests
-    bool test_passed = true;
-    for (auto& test : {test_lut, test_linear4_fp16, test_binary, test_mv}) {
-        try {
-            test();
-        } catch (const std::exception& e) {
-            std::cerr << e.what() << std::endl;
-            test_passed = false;
-            continue;
-        }
+    std::optional<std::string> select_for_profile = std::nullopt;
+    size_t k = 4096;
+    if (argc > 1) {
+        select_for_profile = argv[1];
     }
-    if (!test_passed) {
-        std::cerr << "!!! TESTS FAILED !!!\n" << std::endl;
+    if (argc > 2) {
+        k = std::stoul(argv[2]);
+    }
+
+    // Tests
+    if (!select_for_profile) {
+        bool test_passed = true;
+        for (auto& test : {test_lut, test_linear4_fp16, test_binary, test_mv}) {
+            try {
+                test();
+                cudaStreamSynchronize(0);
+            } catch (const std::exception& e) {
+                std::cerr << e.what() << std::endl;
+                test_passed = false;
+                continue;
+            }
+        }
+        if (!test_passed) {
+            std::cerr << "!!! TESTS FAILED !!!\n" << std::endl;
+        }
+    } else {
+        std::cerr << "Skipping tests\n" << std::endl;
     }
 
     // Benchmarking
     Log log({{"device", device_name}, {"cuda_version", cuda_version}});
-    benchmark_conversions(log);
-    benchmark_mv(log);
+    std::regex pattern =
+        select_for_profile ? std::regex("^" + *select_for_profile + "$") : std::regex("^(.*)$");
+    benchmark_conversions(log, pattern, /*reps*/ 10);
+    benchmark_mv(log, pattern, /*reps*/ 1000, /*k*/ k);
 
     return 0;
 }
