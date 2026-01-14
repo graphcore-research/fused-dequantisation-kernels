@@ -5,8 +5,8 @@ __pycache__
 .venv
 .vscode
 
-/build
 /local
 /notebooks/results
 /out/dev
 /out/profiles
+/src/experimental/build
