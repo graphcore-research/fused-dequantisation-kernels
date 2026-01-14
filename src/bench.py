@@ -804,24 +804,31 @@ def run_tests() -> None:
             fn()
 
 
-def run_benchmarks(settings: Settings, only: str | None, skip: str) -> None:
-    print(f"# {settings}")
+def run_benchmarks(settings: Settings, only: str, include: str, exclude: str) -> None:
+    header_printed = False
     for name, benchmark in BENCHMARKS.items():
-        if (only is None or only == name) and (skip == "" or not re.search(skip, name)):
-            try:
-                print(benchmark.run(settings))
-            except UnsupportedSettings:
-                pass
-    print()
+        if only != "" and only != name:
+            continue
+        if include != "" and not re.search(include, name):
+            continue
+        if exclude != "" and re.search(exclude, name):
+            continue
+        try:
+            result = benchmark.run(settings)
+            if not header_printed:
+                print(f"# {settings}")
+                header_printed = True
+            print(result)
+        except UnsupportedSettings:
+            pass
+    if header_printed:
+        print()
 
 
 def run_main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "profile", nargs="?", help="Select a specific method to profile"
-    )
     parser.add_argument("-m", default=[1, 16], type=int, nargs="+", help="Dimension m")
     parser.add_argument("-k", default=[4096], type=int, nargs="+", help="Dimension k")
     parser.add_argument("-n", default=[4096], type=int, nargs="+", help="Dimension n")
@@ -833,12 +840,15 @@ def run_main() -> None:
     )
     parser.add_argument("--copies", default=100, type=int, help="Number of arg copies")
     parser.add_argument("--reps", default=1000, type=int, help="Number of reps")
+    # Selection
     parser.add_argument(
-        "--skip", default="_ref", help="Implementations to skip (regex)"
+        "--profile", default="", help="Select a specific method to profile (skip tests)"
     )
+    parser.add_argument("--include", default="", help="Methods to include (regex)")
+    parser.add_argument("--exclude", default="_ref", help="Methods to exclude (regex)")
     args = parser.parse_args()
 
-    if args.profile is None:
+    if args.profile == "":
         run_tests()
 
     keys = ["m", "k", "n", "g", "bits"]
@@ -846,7 +856,8 @@ def run_main() -> None:
         run_benchmarks(
             Settings(**dict(zip(keys, values)), copies=args.copies, reps=args.reps),
             only=args.profile,
-            skip=args.skip,
+            include=args.include,
+            exclude=args.exclude,
         )
 
 
