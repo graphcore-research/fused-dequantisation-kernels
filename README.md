@@ -1,13 +1,15 @@
 # Quantisation benchmarking
 
 ```sh
-# Build and run cpp/bench.cu
+# Build and run src/bench.cu
 ninja build/bench
 ./build/bench
 
 # Note: build ptx
 ninja build/bench.ptx
 ```
+
+Setup note: `echo 'export PYTHONPATH=$(dirname ${VIRTUAL_ENV})/src' >> .venv/bin/activate`
 
 ## Profiling
 

@@ -21,7 +21,7 @@ rule link
   command = $nvcc -o $out $in $libs
   description = LINK $out
 
-build build/bench.o: compile cpp/bench.cu
+build build/bench.o: compile src/bench.cu
 build build/bench: link build/bench.o
 
-build build/bench.ptx: ptx cpp/bench.cu
+build build/bench.ptx: ptx src/bench.cu

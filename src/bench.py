@@ -1,5 +1,7 @@
 """Triton implementations and benchmarks."""
 
+import itertools
+import re
 from dataclasses import dataclass
 from typing import Callable
 
@@ -63,6 +65,12 @@ class Settings:
     bits: int
     copies: int
     reps: int
+
+    def __str__(self) -> str:
+        return (
+            f"m={self.m} k={self.k} n={self.n} g={self.g} "
+            f"bits={self.bits} copies={self.copies} reps={self.reps}"
+        )
 
 
 @dataclass
@@ -367,7 +375,7 @@ RegisterBenchmark_mv_lut8("mv_lut8_ref", mm_lut_ref)
     key=["k", "ELEMENTS_PER_BYTE", "GROUP_SIZE"],
 )
 @triton.jit
-def kernel__mv_lut8(
+def kernel__mv_lut(
     a_ptr,
     b_ptr,
     lut_ptr,
@@ -429,7 +437,7 @@ def kernel__mv_lut8(
     tl.store(out_ptr + n, out)
 
 
-def run_mv_lut8(a: Tensor, b: Tensor, lut: Tensor, bs: Tensor, out: Tensor) -> None:
+def run_mv_lut(a: Tensor, b: Tensor, lut: Tensor, bs: Tensor, out: Tensor) -> None:
     # shape inference
     (k,) = a.shape
     (n,) = out.shape
@@ -444,7 +452,7 @@ def run_mv_lut8(a: Tensor, b: Tensor, lut: Tensor, bs: Tensor, out: Tensor) -> N
     assert all([t.is_contiguous() for t in [a, b, lut, bs, out]])
     # kernel
     grid = (n,)
-    kernel__mv_lut8[grid](
+    kernel__mv_lut[grid](
         a,
         b,
         lut,
@@ -466,11 +474,11 @@ def test_mv_4b_lut8() -> None:
     lut8 = torch.cartesian_prod(lut4, lut4)
     bs = torch.rand((n, k // g), device="cuda", dtype=torch.bfloat16)
     out = torch.empty((n,), device="cuda", dtype=torch.bfloat16)
-    run_mv_lut8(a, bq, lut8, bs, out)
+    run_mv_lut(a, bq, lut8, bs, out)
     assert_rmsen(mm_lut_ref(a, bq, lut8, bs), out, tol=1e-2)
 
 
-RegisterBenchmark_mv_lut8("mv_lut8", run_mv_lut8)
+RegisterBenchmark_mv_lut8("mv_lut8", run_mv_lut)
 
 ### mm
 
@@ -623,17 +631,22 @@ RegisterBenchmark_mm_lut8("mm_lut8_ref", mm_lut_ref)
     configs=[
         # Hand-tuned for 1-8b, m in [16, 64, 256], n = k in 3-8k on L40S
         triton.Config(
-            dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=16, BLOCK_SIZE_K=256, GROUP_SIZE_M=8),
+            dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=16, BLOCK_SIZE_K=128, GROUP_SIZE_M=8),
             num_stages=1,
-            num_warps=4,
+            num_warps=1,
         ),
         triton.Config(
-            dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, BLOCK_SIZE_K=64, GROUP_SIZE_M=8),
+            dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=16, BLOCK_SIZE_K=64, GROUP_SIZE_M=8),
             num_stages=1,
-            num_warps=2,
+            num_warps=1,
         ),
         triton.Config(
-            dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=16, BLOCK_SIZE_K=256, GROUP_SIZE_M=8),
+            dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, BLOCK_SIZE_K=64, GROUP_SIZE_M=8),
+            num_stages=1,
+            num_warps=1,
+        ),
+        triton.Config(
+            dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=8, BLOCK_SIZE_K=256, GROUP_SIZE_M=8),
             num_stages=1,
             num_warps=2,
         ),
@@ -791,13 +804,15 @@ def run_tests() -> None:
             fn()
 
 
-def run_benchmarks(settings: Settings, only: str | None = None) -> None:
+def run_benchmarks(settings: Settings, only: str | None, skip: str) -> None:
+    print(f"# {settings}")
     for name, benchmark in BENCHMARKS.items():
-        if only is None or only == name:
+        if (only is None or only == name) and (skip == "" or not re.search(skip, name)):
             try:
                 print(benchmark.run(settings))
-            except UnsupportedSettings as e:
+            except UnsupportedSettings:
                 pass
+    print()
 
 
 def run_main() -> None:
@@ -807,32 +822,32 @@ def run_main() -> None:
     parser.add_argument(
         "profile", nargs="?", help="Select a specific method to profile"
     )
-    parser.add_argument("-m", default=16, type=int, help="Dimension m")
-    parser.add_argument("-k", default=4096, type=int, help="Dimension k")
-    parser.add_argument("-n", default=4096, type=int, help="Dimension n")
-    parser.add_argument("-g", default=64, type=int, help="Dimension g (group size)")
+    parser.add_argument("-m", default=[1, 16], type=int, nargs="+", help="Dimension m")
+    parser.add_argument("-k", default=[4096], type=int, nargs="+", help="Dimension k")
+    parser.add_argument("-n", default=[4096], type=int, nargs="+", help="Dimension n")
     parser.add_argument(
-        "-b", "--bits", default=16, type=int, help="Bits per element (1, 2, 4, 8, 16)"
+        "-g", default=[64], type=int, nargs="+", help="Dimension g (group size)"
+    )
+    parser.add_argument(
+        "-b", "--bits", default=[16, 4, 1], type=int, nargs="+", help="Bits per element"
     )
     parser.add_argument("--copies", default=100, type=int, help="Number of arg copies")
     parser.add_argument("--reps", default=1000, type=int, help="Number of reps")
+    parser.add_argument(
+        "--skip", default="_ref", help="Implementations to skip (regex)"
+    )
     args = parser.parse_args()
 
     if args.profile is None:
         run_tests()
 
-    run_benchmarks(
-        Settings(
-            m=args.m,
-            k=args.k,
-            n=args.n,
-            g=args.g,
-            bits=args.bits,
-            copies=args.copies,
-            reps=args.reps,
-        ),
-        only=args.profile,
-    )
+    keys = ["m", "k", "n", "g", "bits"]
+    for values in itertools.product(*(getattr(args, k) for k in keys)):
+        run_benchmarks(
+            Settings(**dict(zip(keys, values)), copies=args.copies, reps=args.reps),
+            only=args.profile,
+            skip=args.skip,
+        )
 
 
 if __name__ == "__main__":

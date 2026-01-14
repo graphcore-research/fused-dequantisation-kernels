@@ -7,5 +7,6 @@ __pycache__
 
 /build
 /local
+/notebooks/results
 /out/dev
 /out/profiles
