@@ -1,6 +1,7 @@
 """Triton implementations and benchmarks."""
 
 import datetime
+import gc
 import itertools
 import json
 import math
@@ -426,6 +427,9 @@ def run_tests() -> None:
 def run_benchmarks(
     settings: Settings, only: str, include: str, exclude: str, log: Log
 ) -> None:
+
+    gc.collect()
+    torch.cuda.empty_cache()
     header_printed = False
     for name, benchmark in BENCHMARKS.items():
         if only != "" and only != name:
