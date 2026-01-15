@@ -1,17 +1,20 @@
 nvcc = nvcc
-arch = sm_89
-cflags = -O3 -std=c++17 -arch=$arch $
-  -Xcompiler '-Wall -Wextra -Werror -fdiagnostics-color=always'
+
+# Ada Lovelace (L40S) and Hopper
+arch = -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90
+arch_ptx = -gencode=arch=compute_89,code=sm_89
+
+cflags = -O3 -std=c++17 -Xcompiler '-Wall -Wextra -Werror -fdiagnostics-color=always'
 libs = -lcublasLt
 
 rule compile
-  command = $nvcc $cflags -MD -MF $out.d -c -o $out $in
+  command = $nvcc $cflags $arch -MD -MF $out.d -c -o $out $in
   description = NVCC $out
   deps = gcc
   depfile = $out.d
 
 rule ptx
-  command = $nvcc $cflags -MD -MF $out.d -ptx -o $out $in $
+  command = $nvcc $cflags $arch_ptx -MD -MF $out.d -ptx -o $out $in $
     && sed -i '/\/\/ \(begin\|end\) inline asm/d' $out
   description = PTX $out
   deps = gcc
