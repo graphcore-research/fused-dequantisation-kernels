@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -104,6 +105,22 @@ std::string get_cuda_version() {
     uint cuda_major = cuda_version / 1000;
     uint cuda_minor = (cuda_version % 1000) / 10;
     return std::to_string(cuda_major) + "." + std::to_string(cuda_minor);
+}
+
+std::string get_commit_hash() {
+    FILE* pipe = popen("git rev-parse HEAD 2>/dev/null", "r");
+    if (!pipe) {
+        return "";
+    }
+    char buffer[64];
+    if (fgets(buffer, sizeof(buffer), pipe)) {
+        pclose(pipe);
+        std::string hash(buffer);
+        hash.erase(std::remove(hash.begin(), hash.end(), '\n'), hash.end());
+        return hash;
+    }
+    pclose(pipe);
+    return "";
 }
 
 struct Log {
@@ -1474,6 +1491,8 @@ int main(int argc, char** argv) {
     std::cerr << "CUDA version: " << cuda_version << std::endl;
     std::cerr << std::endl;
 
+    auto commit = get_commit_hash();
+
     std::optional<std::string> select_for_profile = std::nullopt;
     size_t k = 4096;
     if (argc > 1) {
@@ -1504,7 +1523,7 @@ int main(int argc, char** argv) {
     }
 
     // Benchmarking
-    Log log({{"device", device_name}, {"cuda_version", cuda_version}});
+    Log log({{"device", device_name}, {"cuda_version", cuda_version}, {"commit", commit}});
     std::regex pattern =
         select_for_profile ? std::regex("^" + *select_for_profile + "$") : std::regex("^(.*)$");
     benchmark_conversions(log, pattern, /*reps*/ 10);

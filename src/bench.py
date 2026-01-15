@@ -4,6 +4,7 @@ import datetime
 import itertools
 import json
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,11 +28,13 @@ def _current_timestamp() -> str:
 
 
 def _meta() -> dict[str, Any]:
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
     return dict(
         device=torch.cuda.get_device_name(torch.cuda.current_device()),
         cuda_version=torch.version.cuda,
         torch_version=torch.__version__,
         triton_version=triton.__version__,
+        commit=commit,
     )
 
 
