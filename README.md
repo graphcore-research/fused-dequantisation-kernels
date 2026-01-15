@@ -4,7 +4,13 @@
 python src/bench.py
 ```
 
-Setup note: `echo 'export PYTHONPATH=$(dirname ${VIRTUAL_ENV})/src' >> .venv/bin/activate`
+First-time setup:
+
+```sh
+sudo apt install ninja-build pybind11-dev
+uv sync
+echo 'export PYTHONPATH=$(dirname ${VIRTUAL_ENV})/src' >> .venv/bin/activate
+```
 
 ## Experimental code
 
