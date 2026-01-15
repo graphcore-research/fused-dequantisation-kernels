@@ -3,6 +3,7 @@
 import datetime
 import itertools
 import json
+import math
 import re
 import subprocess
 import sys
@@ -61,7 +62,9 @@ class Log:
         self.file.close()
 
 
-def measure_time(fn: Callable[[None], None], reps: int) -> float:
+def measure_time(
+    fn: Callable[[None], None], inner_reps: int, outer_reps: int
+) -> tuple[float, float]:
     fn(0)  # Initial warmup (autotune & JIT)
 
     # Further warmup & capture a graph
@@ -71,7 +74,7 @@ def measure_time(fn: Callable[[None], None], reps: int) -> float:
     with torch.cuda.stream(static_stream):
         torch.cuda.synchronize()
         with torch.cuda.graph(g):
-            for i in range(reps):
+            for i in range(inner_reps):
                 fn(i)
     torch.cuda.synchronize()
 
@@ -82,13 +85,17 @@ def measure_time(fn: Callable[[None], None], reps: int) -> float:
     # Measure time
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    g.replay()
-    end.record()
-    torch.cuda.synchronize()
+    times: list[float] = []
+    for _ in range(outer_reps):
+        start.record()
+        g.replay()
+        end.record()
+        torch.cuda.synchronize()
+        elapsed_ms = start.elapsed_time(end)
+        times.append(elapsed_ms / inner_reps / 1000)
 
-    elapsed_ms = start.elapsed_time(end)
-    return elapsed_ms / reps / 1000
+    atimes = torch.tensor(times)
+    return atimes.mean().item(), atimes.std().item() / math.sqrt(len(atimes))
 
 
 def sizeof(*tensors: Tensor) -> int:
@@ -106,13 +113,16 @@ class Settings:
     g: int
     bits: int
     copies: int
-    reps: int
+    inner_reps: int
+    outer_reps: int
+
+    def __post_init__(self) -> None:
+        assert (
+            self.copies <= self.inner_reps
+        ), "insufficient inner_reps to cycle through all copies"
 
     def __str__(self) -> str:
-        return (
-            f"m={self.m} k={self.k} n={self.n} g={self.g} "
-            f"bits={self.bits} copies={self.copies} reps={self.reps}"
-        )
+        return f"m={self.m} k={self.k} n={self.n} g={self.g} bits={self.bits}"
 
 
 @dataclass
@@ -121,6 +131,7 @@ class Result:
     bytes_rw: int
     ops: int
     time_s: float
+    stderr_s: float
 
     def __str__(self) -> str:
         bandwidth = self.bytes_rw / self.time_s / 1e9
@@ -157,12 +168,13 @@ class Benchmark:
     def run(self, s: Settings) -> Result:
         torch.manual_seed(42)
         fn = self.setup(s)
-        time_s = measure_time(fn, s.reps)
+        time_s, stderr_s = measure_time(fn, s.inner_reps, s.outer_reps)
         return Result(
             name=self.name,
             bytes_rw=self.bytes_rw(s),
             ops=self.ops(s),
             time_s=time_s,
+            stderr_s=stderr_s,
         )
 
 
@@ -435,6 +447,7 @@ def run_benchmarks(
                     bytes_rw=result.bytes_rw,
                     ops=result.ops,
                     avg_time=result.time_s,
+                    avg_time_stderr=result.stderr_s,
                 )
             )
         except UnsupportedSettings:
@@ -461,7 +474,10 @@ def run_main() -> None:
         "-b", "--bits", default=[16, 4, 1], type=int, nargs="+", help="Bits per element"
     )
     parser.add_argument("--copies", default=100, type=int, help="Number of arg copies")
-    parser.add_argument("--reps", default=1000, type=int, help="Number of reps")
+    parser.add_argument("--inner-reps", default=100, type=int, help="Number of reps")
+    parser.add_argument(
+        "--outer-reps", default=100, type=int, help="Number of rep samples"
+    )
     # Selection
     parser.add_argument(
         "--profile", default="", help="Select a specific method to profile (skip tests)"
@@ -480,7 +496,12 @@ def run_main() -> None:
             if s["n"] == "k":
                 s["n"] = s["k"]
             run_benchmarks(
-                Settings(**s, copies=args.copies, reps=args.reps),
+                Settings(
+                    **s,
+                    copies=args.copies,
+                    inner_reps=args.inner_reps,
+                    outer_reps=args.outer_reps,
+                ),
                 only=args.profile,
                 include=args.include,
                 exclude=args.exclude,

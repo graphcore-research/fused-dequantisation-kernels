@@ -4,9 +4,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -17,6 +18,7 @@
 #include <sstream>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
@@ -1099,12 +1101,20 @@ void test_mv() {
 // --------------------------
 // Benchmarking
 
-double measure_time(uint reps, cudaStream_t stream, const std::function<void(uint)>& fn) {
+struct TimingStats {
+    double avg_time;
+    double avg_time_stderr;
+};
+
+TimingStats measure_time(uint inner_reps,
+                         uint outer_reps,
+                         cudaStream_t stream,
+                         const std::function<void(uint)>& fn) {
     cudaGraph_t graph;
     cudaGraphExec_t graphExec;
 
     CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-    for (uint i = 0; i < reps; i++) {
+    for (uint i = 0; i < inner_reps; i++) {
         fn(i);
     }
     CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
@@ -1112,26 +1122,46 @@ double measure_time(uint reps, cudaStream_t stream, const std::function<void(uin
     CHECK_CUDA(cudaStreamSynchronize(stream));
 
     // timing
+    constexpr uint sample_count = 4;
     cudaEvent_t start, end;
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&end));
 
-    CHECK_CUDA(cudaEventRecord(start, stream));
+    // One warmup replay to mirror the previous behaviour
     CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
-    CHECK_CUDA(cudaEventRecord(end, stream));
-    CHECK_CUDA(cudaEventSynchronize(end));
+    CHECK_CUDA(cudaStreamSynchronize(stream));
 
-    float time_ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&time_ms, start, end));
+    std::vector<double> samples;
+    for (auto i = 0u; i < outer_reps; ++i) {
+        CHECK_CUDA(cudaEventRecord(start, stream));
+        CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
+        CHECK_CUDA(cudaEventRecord(end, stream));
+        CHECK_CUDA(cudaEventSynchronize(end));
+
+        float sample_ms = 0.0f;
+        CHECK_CUDA(cudaEventElapsedTime(&sample_ms, start, end));
+        samples.push_back(static_cast<double>(sample_ms) * 1e-3 / inner_reps);
+    }
+
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(end));
     CHECK_CUDA(cudaGraphDestroy(graph));
     CHECK_CUDA(cudaGraphExecDestroy(graphExec));
 
-    return time_ms * 1e-3 / reps;
+    auto mean = std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
+    auto variance = 0.0;
+    for (auto sample : samples) {
+        variance += std::pow(sample - mean, 2);
+    }
+    variance /= static_cast<double>(samples.size() - 1);
+    auto stderr_ = std::sqrt(variance / samples.size());
+    return {mean, stderr_};
 }
 
-void benchmark_conversions(Log& log, const std::regex& pattern, const uint reps) {
+void benchmark_conversions(Log& log,
+                           const std::regex& pattern,
+                           const uint inner_reps,
+                           const uint outer_reps) {
     constexpr size_t bytes = 4 * (1ull << 30);
     static_assert(bytes % 16 == 0, "bytes must be a multiple of 16 for uint4 fill");
 
@@ -1146,21 +1176,23 @@ void benchmark_conversions(Log& log, const std::regex& pattern, const uint reps)
         if (!std::regex_match(name, pattern)) {
             return;
         }
-        double avg_time = measure_time(reps, stream, fn);
+        auto stats = measure_time(inner_reps, outer_reps, stream, fn);
         std::ostringstream time_str, bw_str;
-        time_str << std::fixed << std::setprecision(2) << (avg_time * 1e3) << " ms";
+        time_str << std::fixed << std::setprecision(2) << (stats.avg_time * 1e3) << " ms";
         bw_str << std::fixed << std::setprecision(1)
-               << ((bytes_read + bytes_write) / avg_time) / 1e9 << " GB/s";
+               << ((bytes_read + bytes_write) / stats.avg_time) / 1e9 << " GB/s";
         std::cerr << std::setw(18) << std::left << name << "  " << std::setw(12) << std::right
                   << time_str.str() << "  " << std::setw(12) << std::right << bw_str.str()
                   << std::endl;
 
         // Write JSON log (one object per measurement)
         log({{"test", name},
-             {"avg_time", avg_time},
+             {"avg_time", stats.avg_time},
+             {"avg_time_stderr", stats.avg_time_stderr},
              {"bytes_read", static_cast<uint64_t>(bytes_read)},
              {"bytes_write", static_cast<uint64_t>(bytes_write)},
-             {"reps", static_cast<uint64_t>(reps)}});
+             {"inner_reps", static_cast<uint64_t>(inner_reps)},
+             {"outer_reps", static_cast<uint64_t>(outer_reps)}});
     };
 
     std::cerr << "### benchmark_conversions" << std::endl;
@@ -1298,7 +1330,11 @@ void benchmark_conversions(Log& log, const std::regex& pattern, const uint reps)
     std::cerr << std::endl;
 }
 
-void benchmark_mv(Log& log, const std::regex& pattern, const size_t reps, const size_t k) {
+void benchmark_mv(Log& log,
+                  const std::regex& pattern,
+                  const size_t inner_reps,
+                  const size_t outer_reps,
+                  const size_t k) {
     const size_t n = 4096;
     const size_t copies = 100;  // cycle through separate args to avoid cache hits
 
@@ -1309,21 +1345,23 @@ void benchmark_mv(Log& log, const std::regex& pattern, const size_t reps, const 
         if (!std::regex_match(name, pattern)) {
             return;
         }
-        double avg_time = measure_time(reps, stream, fn);
+        auto stats = measure_time(inner_reps, outer_reps, stream, fn);
         std::ostringstream time_str, bw_str;
-        time_str << std::fixed << std::setprecision(1) << (avg_time * 1e6) << " us";
+        time_str << std::fixed << std::setprecision(1) << (stats.avg_time * 1e6) << " us";
         bw_str << std::fixed << std::setprecision(1)
-               << ((bytes_read + bytes_write) / avg_time) / 1e9 << " GB/s";
+               << ((bytes_read + bytes_write) / stats.avg_time) / 1e9 << " GB/s";
         std::cerr << std::setw(18) << std::left << name << "  " << std::setw(12) << std::right
                   << time_str.str() << "  " << std::setw(12) << std::right << bw_str.str()
                   << std::endl;
 
         // Write JSON log (one object per measurement)
         log({{"test", name},
-             {"avg_time", avg_time},
+             {"avg_time", stats.avg_time},
+             {"avg_time_stderr", stats.avg_time_stderr},
              {"bytes_read", static_cast<uint64_t>(bytes_read)},
              {"bytes_write", static_cast<uint64_t>(bytes_write)},
-             {"reps", static_cast<uint64_t>(reps)}});
+             {"inner_reps", static_cast<uint64_t>(inner_reps)},
+             {"outer_reps", static_cast<uint64_t>(outer_reps)}});
     };
 
     std::cerr << "### benchmark_mv" << std::endl;
@@ -1526,8 +1564,8 @@ int main(int argc, char** argv) {
     Log log({{"device", device_name}, {"cuda_version", cuda_version}, {"commit", commit}});
     std::regex pattern =
         select_for_profile ? std::regex("^" + *select_for_profile + "$") : std::regex("^(.*)$");
-    benchmark_conversions(log, pattern, /*reps*/ 10);
-    benchmark_mv(log, pattern, /*reps*/ 1000, /*k*/ k);
+    benchmark_conversions(log, pattern, /*inner_reps*/ 1, /*outer_reps*/ 10);
+    benchmark_mv(log, pattern, /*inner_reps*/ 100, /*outer_reps*/ 100, /*k*/ k);
 
     return 0;
 }
