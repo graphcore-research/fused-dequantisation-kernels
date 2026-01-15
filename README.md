@@ -2,6 +2,9 @@
 
 ```sh
 python src/bench.py
+
+# Long run
+python src/bench.py --exclude '' -b 16 8 4 2 1 -k 8192 6144 4096 3072
 ```
 
 First-time setup:

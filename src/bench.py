@@ -451,7 +451,9 @@ def run_main() -> None:
         "-m", default=[1, 16, 64, 256], type=int, nargs="+", help="Dimension m"
     )
     parser.add_argument("-k", default=[4096], type=int, nargs="+", help="Dimension k")
-    parser.add_argument("-n", default=[4096], type=int, nargs="+", help="Dimension n")
+    parser.add_argument(
+        "-n", default=["k"], nargs="+", help="Dimension n (int or 'k' for square)"
+    )
     parser.add_argument(
         "-g", default=[64], type=int, nargs="+", help="Dimension g (group size)"
     )
@@ -474,8 +476,11 @@ def run_main() -> None:
     with Log() as log:
         keys = ["m", "k", "n", "g", "bits"]
         for values in itertools.product(*(getattr(args, k) for k in keys)):
+            s = dict(zip(keys, values))
+            if s["n"] == "k":
+                s["n"] = s["k"]
             run_benchmarks(
-                Settings(**dict(zip(keys, values)), copies=args.copies, reps=args.reps),
+                Settings(**s, copies=args.copies, reps=args.reps),
                 only=args.profile,
                 include=args.include,
                 exclude=args.exclude,
