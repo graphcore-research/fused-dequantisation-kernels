@@ -1,17 +1,61 @@
 """Triton implementations and benchmarks."""
 
+import datetime
 import itertools
+import json
 import re
+import sys
 from dataclasses import dataclass
-from typing import Callable
+from pathlib import Path
+from typing import Any, Callable
 
 import torch
+import triton
 from torch import Tensor
 
 import kernels
 import marlin
 
 # Utilities
+
+
+LOG_DIR = Path("out/dev")
+
+
+def _current_timestamp() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
+
+
+def _meta() -> dict[str, Any]:
+    return dict(
+        device=torch.cuda.get_device_name(torch.cuda.current_device()),
+        cuda_version=torch.version.cuda,
+        torch_version=torch.__version__,
+        triton_version=triton.__version__,
+    )
+
+
+class Log:
+    def __init__(self) -> None:
+        self.id = f"py-{_current_timestamp()}"
+        self.meta = dict(id=self.id, **_meta())
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        self.path = LOG_DIR / f"{self.id}.jsonl"
+        self.file = self.path.open("w", encoding="utf-8")
+
+    def __call__(self, entry: dict[str, Any]) -> None:
+        print(json.dumps({**entry, **self.meta}), file=self.file, flush=True)
+
+    def __enter__(self) -> "Log":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type | None,
+        exc_value: BaseException | None,
+        traceback: Any | None,
+    ) -> None:
+        self.file.close()
 
 
 def measure_time(fn: Callable[[None], None], reps: int) -> float:
@@ -364,7 +408,9 @@ def run_tests() -> None:
             fn()
 
 
-def run_benchmarks(settings: Settings, only: str, include: str, exclude: str) -> None:
+def run_benchmarks(
+    settings: Settings, only: str, include: str, exclude: str, log: Log
+) -> None:
     header_printed = False
     for name, benchmark in BENCHMARKS.items():
         if only != "" and only != name:
@@ -376,13 +422,22 @@ def run_benchmarks(settings: Settings, only: str, include: str, exclude: str) ->
         try:
             result = benchmark.run(settings)
             if not header_printed:
-                print(f"# {settings}")
+                print(f"# {settings}", file=sys.stderr)
                 header_printed = True
-            print(result)
+            print(result, file=sys.stderr)
+            log(
+                dict(
+                    test=name,
+                    **settings.__dict__,
+                    bytes_rw=result.bytes_rw,
+                    ops=result.ops,
+                    avg_time=result.time_s,
+                )
+            )
         except UnsupportedSettings:
             pass
     if header_printed:
-        print()
+        print(file=sys.stderr)
 
 
 def run_main() -> None:
@@ -413,14 +468,16 @@ def run_main() -> None:
     if args.profile == "":
         run_tests()
 
-    keys = ["m", "k", "n", "g", "bits"]
-    for values in itertools.product(*(getattr(args, k) for k in keys)):
-        run_benchmarks(
-            Settings(**dict(zip(keys, values)), copies=args.copies, reps=args.reps),
-            only=args.profile,
-            include=args.include,
-            exclude=args.exclude,
-        )
+    with Log() as log:
+        keys = ["m", "k", "n", "g", "bits"]
+        for values in itertools.product(*(getattr(args, k) for k in keys)):
+            run_benchmarks(
+                Settings(**dict(zip(keys, values)), copies=args.copies, reps=args.reps),
+                only=args.profile,
+                include=args.include,
+                exclude=args.exclude,
+                log=log,
+            )
 
 
 if __name__ == "__main__":
