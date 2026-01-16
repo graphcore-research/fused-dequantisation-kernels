@@ -72,13 +72,13 @@ class QuantisedLinear(nn.Module):
         weight_indices = torch.bucketize(
             weight_scaled, (lut1[1:] + lut1[:-1]) / 2
         ).clamp_(0, 2**c.bits - 1)
+        multipliers = 2 ** torch.arange(
+            0, 8, c.bits, device=device, dtype=torch.uint8
+        ).flip(0)
         weight_data = (
             weight_indices.to(torch.uint8)
             .unflatten(-1, (-1, elements_per_byte))
-            .mul(
-                2
-                ** torch.arange(0, 8, c.bits, device=device, dtype=torch.uint8).flip(0)
-            )
+            .mul(multipliers)
             .sum(-1, dtype=torch.uint8)
         )
         lut = torch.cartesian_prod(*([lut1] * elements_per_byte)).view(256, -1)
@@ -96,11 +96,14 @@ def test_quantised_linear() -> None:
 
 
 def quantise(
-    module: nn.Module, config: QuantisationConfig, device: torch.device
+    module: nn.Module,
+    config: QuantisationConfig,
+    device: torch.device,
+    dtype: torch.dtype,
 ) -> nn.Module:
     """In-place quantisation of all nn.Linear layers in a module.
 
-    Any parameter sharing is not preserved.
+    Note: any parameter sharing is lost.
     """
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
@@ -111,14 +114,14 @@ def quantise(
             assert (
                 child.in_features % 64 == 0
             ), f"in_features must be multiple of 64, got {child.in_features}"
-            setattr(
-                module,
-                name,
-                QuantisedLinear.create(child.weight.data.to(device), config),
-            )
-        else:
-            quantise(child, config, device)
-    module.to(device)  # convert non-quantised modules
+
+            weight = child.weight.data.to(device=device, dtype=dtype)
+            setattr(module, name, QuantisedLinear.create(weight, config))
+
+        else:  # recurse
+            quantise(child, config, device=device, dtype=dtype)
+
+    module.to(device=device, dtype=dtype)  # convert non-quantised modules
     return module
 
 
@@ -129,9 +132,10 @@ class Generator:
     """A graph-captureable autoregressive text generator."""
 
     def __init__(
-        self, model: transformers.PreTrainedModel, prompt_ids: Tensor, max_length: int
+        self, model: transformers.PreTrainedModel, prompt_ids: Tensor, steps: int
     ) -> None:
         batch_size, prompt_n = prompt_ids.shape
+        max_length = prompt_n + steps + 1  # +1 for prefill, which happens before step()
         self.model = model
         self.input_ids = torch.zeros(
             (batch_size, max_length), dtype=torch.long, device=model.device
@@ -166,16 +170,16 @@ class Result:
     batch_size: int
     bytes_rw: int
     ops: int
-    time_s: float
-    stderr_s: float
+    avg_time: float
+    avg_time_stderr: float
     output: list[str]
 
     def __str__(self) -> str:
-        bandwidth = self.bytes_rw / self.time_s / 1e9
-        ops_per_s = self.ops / self.time_s / 1e12
+        bandwidth = self.bytes_rw / self.avg_time / 1e9
+        ops_per_s = self.ops / self.avg_time / 1e12
         return "  ".join(
             [
-                f"{self.batch_size / self.time_s:>6.1f} tokens/s",
+                f"{self.batch_size / self.avg_time:>6.1f} tokens/s",
                 f"{bandwidth:>6.1f} GB/s",
                 f"{ops_per_s:>6.1f} TFLOPS",
             ]
@@ -193,32 +197,120 @@ def count_ops(model: transformers.PreTrainedModel) -> int:
     return ops
 
 
+def count_parameter_read_bytes(model: transformers.PreTrainedModel) -> int:
+    """Approximate bytes read per token."""
+    bytes_r = 0
+    for module in model.modules():
+        # Ignore sparse modules (embeddings), with negligible reads
+        if not isinstance(module, nn.Embedding):
+            bytes_r += sum(
+                p.numel() * p.element_size() for p in module.parameters(recurse=False)
+            )
+    return bytes_r
+
+
 def benchmark(
     model: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizerBase,
     batch_size: int,
-    steps: int,
+    reps: int,
     prompt: str = "The",
 ) -> Result:
     """Measure generation performance of a model."""
-    prompt_ids = (
-        tokenizer([prompt] * batch_size, return_tensors="pt").to(model.device).input_ids
+    with torch.no_grad():
+        prompt_ids = (
+            tokenizer([prompt] * batch_size, return_tensors="pt")
+            .to(model.device)
+            .input_ids
+        )
+        # +3 as measure_time runs 3 "warmup/capture" iterations
+        generator = Generator(model, prompt_ids, reps + 3)
+        avg_time, avg_time_stderr = qbench.measure_time(
+            lambda _: generator.step(), inner_reps=1, outer_reps=reps
+        )
+        # approximate operations and bytes transferred
+        return Result(
+            batch_size=batch_size,
+            bytes_rw=count_parameter_read_bytes(model),
+            ops=batch_size * count_ops(model),
+            avg_time=avg_time,
+            avg_time_stderr=avg_time_stderr,
+            output=tokenizer.batch_decode(generator.tokens),
+        )
+
+
+# Custom model configs
+
+custom_llama_configs = {
+    "4B": dict(
+        dim=3072,
+        n_layers=24,
+        n_heads=24,
+        n_kv_heads=8,
+        ffn_dim_multiplier=1.3,
+        multiple_of=1024,
+        rope_theta=500000,
+        attn_mask_type="block_causal",
+        attn_type="flex",
+    ),
+    "11B": dict(
+        dim=4096,
+        n_layers=48,
+        n_heads=32,
+        n_kv_heads=8,
+        ffn_dim_multiplier=1.3,
+        multiple_of=1024,
+        rope_theta=500000,
+        attn_mask_type="block_causal",
+        attn_type="flex",
+    ),
+    "30B": dict(
+        dim=6144,
+        n_layers=60,
+        n_heads=48,
+        n_kv_heads=8,
+        ffn_dim_multiplier=1.3,
+        multiple_of=1024,
+        rope_theta=500000,
+        attn_mask_type="block_causal",
+        attn_type="flex",
+    ),
+}
+
+
+def get_custom_llama_config(key: str) -> transformers.PretrainedConfig:
+    config = custom_llama_configs[key].copy()
+
+    # defaults
+    vocab_size = 128256  # Llama 3
+    tie_word_embeddings = False
+
+    # computed
+    dim = config.pop("dim")
+    ffn_dim_multiplier = config.pop("ffn_dim_multiplier")
+    multiple_of = config.pop("multiple_of")
+    intermediate_size = multiple_of * (
+        (int(4 * 2 / 3 * dim * ffn_dim_multiplier) + multiple_of - 1) // multiple_of
     )
-    generator = Generator(model, prompt_ids, steps + 4)
-    time_s, time_s_stderr = qbench.measure_time(
-        lambda _: generator.step(), inner_reps=1, outer_reps=steps
+
+    # unneeded for inference
+    del config["attn_mask_type"]
+    del config["attn_type"]
+
+    transformers_config = transformers.models.llama.modeling_llama.LlamaConfig(
+        _name_or_path=f"custom-llama-{key}",
+        vocab_size=vocab_size,
+        hidden_size=dim,
+        num_hidden_layers=config.pop("n_layers"),
+        num_attention_heads=config.pop("n_heads"),
+        num_key_value_heads=config.pop("n_kv_heads"),
+        intermediate_size=intermediate_size,
+        rope_theta=config.pop("rope_theta"),
+        dtype=torch.bfloat16,
+        tie_word_embeddings=tie_word_embeddings,
     )
-    # approximate operations and bytes transferred
-    ops = batch_size * count_ops(model)
-    bytes_r = sum(p.numel() * p.element_size() for p in model.parameters())
-    return Result(
-        batch_size=batch_size,
-        bytes_rw=bytes_r,
-        ops=ops,
-        time_s=time_s,
-        stderr_s=time_s_stderr,
-        output=tokenizer.batch_decode(generator.tokens),
-    )
+    assert not config, f"unused keys {list(config)}"
+    return transformers_config
 
 
 # Top-level
@@ -229,7 +321,7 @@ class BenchmarkSettings:
     model: str
     batch_size: int
     quantisation: QuantisationConfig | None
-    steps: int
+    reps: int
 
     def __str__(self) -> str:
         q = (
@@ -240,7 +332,7 @@ class BenchmarkSettings:
         return f"{self.model} batch={self.batch_size} {q}"
 
 
-def run_benchmark(settings: BenchmarkSettings, log: qbench.Log) -> Result:
+def run_benchmark(settings: BenchmarkSettings, log: qbench.Log) -> None:
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -250,23 +342,35 @@ def run_benchmark(settings: BenchmarkSettings, log: qbench.Log) -> Result:
     del out["quantisation"]
 
     try:
-        device = torch.device("cuda")
-        model = transformers.AutoModelForCausalLM.from_pretrained(
-            settings.model, dtype=torch.bfloat16
-        )
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model.name_or_path)
-        out.update(parameters=sum(p.numel() for p in model.parameters()))
-        with torch.no_grad():
-            if settings.quantisation is not None:
-                quantise(model, settings.quantisation, device)
-            result = benchmark(
-                model.to(device), tokenizer, settings.batch_size, settings.steps
+        device, dtype = torch.device("cuda"), torch.bfloat16
+        if settings.model.startswith("custom-llama-"):
+            key = settings.model.replace("custom-llama-", "")
+            # Create in float32, since bfloat16 RNG on CPU is slow
+            model = transformers.AutoModelForCausalLM.from_config(
+                get_custom_llama_config(key), dtype=torch.float32
             )
-            out.update(result.__dict__)
-            print(f"{str(settings):>40}:  {result}", file=sys.stderr)
+            tokenizer = transformers.AutoTokenizer.from_pretrained(
+                "meta-llama/Llama-3.2-3B"
+            )
+        else:
+            model = transformers.AutoModelForCausalLM.from_pretrained(
+                settings.model, dtype=dtype
+            )
+            tokenizer = transformers.AutoTokenizer.from_pretrained(model.name_or_path)
+
+        out.update(parameters=sum(p.numel() for p in model.parameters()))
+        if settings.quantisation is not None:
+            quantise(model, settings.quantisation, device=device, dtype=dtype)
+
+        model.to(device=device, dtype=dtype)
+        result = benchmark(model, tokenizer, settings.batch_size, settings.reps)
+        out.update(result.__dict__)
+        print(f"{str(settings):>40}:  {result}", file=sys.stderr)
+
     except Exception as e:
         out.update(error=repr(e))
         print(f"{str(settings):>40}:  ERROR {e}", file=sys.stderr)
+
     log(out)
 
 
@@ -276,9 +380,10 @@ def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        default=["Qwen/Qwen3-4B", "Qwen/Qwen3-14B"],
+        default=["custom-llama-4B", "Qwen/Qwen3-14B"],
         nargs="+",
-        help="Model ids",
+        help=f"Model ids, e.g. 'custom-llama-4B' (sizes: {list(custom_llama_configs)})"
+        " or 'Qwen/Qwen3-4B'",
     )
     parser.add_argument(
         "--batch-size",
@@ -302,7 +407,10 @@ def _main() -> None:
         help="Quantisation group sizes",
     )
     parser.add_argument(
-        "--steps", type=int, default=64, help="Number of generation steps"
+        "--reps",
+        type=int,
+        default=64,
+        help="Number of generation steps to measure",
     )
     args = parser.parse_args()
     transformers.utils.logging.disable_progress_bar()
@@ -322,7 +430,7 @@ def _main() -> None:
                 model=s["model"],
                 batch_size=s["batch_size"],
                 quantisation=quantisation,
-                steps=args.steps,
+                reps=args.reps,
             )
             run_benchmark(settings, log)
 

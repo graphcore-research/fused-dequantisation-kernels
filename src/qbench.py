@@ -71,8 +71,7 @@ def measure_time(
     # Further warmup & capture a graph
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    static_stream = torch.cuda.Stream()
-    with torch.cuda.stream(static_stream):
+    with torch.cuda.stream(torch.cuda.Stream()):
         torch.cuda.synchronize()
         with torch.cuda.graph(g):
             for i in range(inner_reps):
