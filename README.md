@@ -1,10 +1,10 @@
 # Quantisation benchmarking
 
 ```sh
-python src/bench.py
+python src/qbench.py
 
 # Long run
-python src/bench.py --exclude '' -b 16 8 4 2 1 -k 8192 6144 4096 3072
+python src/qbench.py --exclude '' -b 16 8 4 2 1 -k 8192 6144 4096 3072
 ```
 
 First-time setup:
@@ -18,7 +18,7 @@ echo 'export PYTHONPATH=$(dirname ${VIRTUAL_ENV})/src' >> .venv/bin/activate
 ## Experimental code
 
 ```sh
-# Build and run src/bench.cu
+# Build and run src/experimental/bench.cu
 ninja -C src/experimental build/bench
 ./src/experimental/build/bench
 
@@ -33,7 +33,7 @@ Requires `ncu`, [NVIDIA Nsight Compute](https://developer.nvidia.com/tools-overv
 ```sh
 mkdir -p out/profiles
 sudo $(which ncu) --kernel-name="regex:.*kernel__mv.*" --launch-skip=100 --launch-count=10 -o out/profiles/cuda_mv_lut8_4b ./src/experimental/build/bench mv_4b_lut8 4096
-sudo $(which ncu) --kernel-name="regex:.*kernel__mv.*" --launch-skip=100 --launch-count=10 -o out/profiles/mv_lut8_4b $(which python) src/bench.py --profile mv_lut8 -b 4
+sudo $(which ncu) --kernel-name="regex:.*kernel__mv.*" --launch-skip=100 --launch-count=10 -o out/profiles/mv_lut8_4b $(which python) src/qbench.py --profile mv_lut8 -b 4
 ```
 
 ## Credits

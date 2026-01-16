@@ -16,7 +16,7 @@ import torch
 import triton
 from torch import Tensor
 
-import kernels
+import qkernels
 import marlin
 
 # Utilities
@@ -41,8 +41,8 @@ def _meta() -> dict[str, Any]:
 
 
 class Log:
-    def __init__(self) -> None:
-        self.id = f"py-{_current_timestamp()}"
+    def __init__(self, key: str) -> None:
+        self.id = f"{key}-{_current_timestamp()}"
         self.meta = dict(id=self.id, **_meta())
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         self.path = LOG_DIR / f"{self.id}.jsonl"
@@ -64,7 +64,7 @@ class Log:
 
 
 def measure_time(
-    fn: Callable[[None], None], inner_reps: int, outer_reps: int
+    fn: Callable[[int], None], inner_reps: int, outer_reps: int
 ) -> tuple[float, float]:
     fn(0)  # Initial warmup (autotune & JIT)
 
@@ -394,17 +394,17 @@ def mm_lut_ref_unscaled(
 
 # mv
 RegisterBenchmark_mv("mv_ref", lambda a, b, out: torch.matmul(a, b.T, out=out[None]))
-RegisterBenchmark_mv("mv", kernels.run_mv)
+RegisterBenchmark_mv("mv", qkernels.run_mv)
 RegisterBenchmark_mv_lut8("mv_lut8_ref_unscaled", mm_lut_ref_unscaled)
-RegisterBenchmark_mv_lut8("mv_lut8_ref", kernels.mm_lut_ref)
-RegisterBenchmark_mv_lut8("mv_lut8", kernels.run_mv_lut)
+RegisterBenchmark_mv_lut8("mv_lut8_ref", qkernels.mm_lut_ref)
+RegisterBenchmark_mv_lut8("mv_lut8", qkernels.run_mv_lut)
 
 # mm
 RegisterBenchmark_mm("mm_ref", lambda a, b, out: torch.matmul(a, b.T, out=out))
-RegisterBenchmark_mm("mm", kernels.run_mm)
+RegisterBenchmark_mm("mm", qkernels.run_mm)
 RegisterBenchmark_mm_lut8("mm_lut8_ref_unscaled", mm_lut_ref_unscaled)
-RegisterBenchmark_mm_lut8("mm_lut8_ref", kernels.mm_lut_ref)
-RegisterBenchmark_mm_lut8("mm_lut8", kernels.run_mm_lut)
+RegisterBenchmark_mm_lut8("mm_lut8_ref", qkernels.mm_lut_ref)
+RegisterBenchmark_mm_lut8("mm_lut8", qkernels.run_mm_lut)
 
 # marlin
 RegisterBenchmark_marlin()
@@ -416,7 +416,7 @@ RegisterBenchmark_marlin()
 def run_tests() -> None:
     tests = [
         (k, v)
-        for k, v in itertools.chain(kernels.__dict__.items(), globals().items())
+        for k, v in itertools.chain(qkernels.__dict__.items(), globals().items())
         if k.startswith("test_")
     ]
     for name, fn in tests:
@@ -460,7 +460,7 @@ def run_benchmarks(
         print(file=sys.stderr)
 
 
-def run_main() -> None:
+def _main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser()
@@ -493,7 +493,7 @@ def run_main() -> None:
     if args.profile == "":
         run_tests()
 
-    with Log() as log:
+    with Log("py") as log:
         keys = ["m", "k", "n", "g", "bits"]
         for values in itertools.product(*(getattr(args, k) for k in keys)):
             s = dict(zip(keys, values))
@@ -514,4 +514,4 @@ def run_main() -> None:
 
 
 if __name__ == "__main__":
-    run_main()
+    _main()

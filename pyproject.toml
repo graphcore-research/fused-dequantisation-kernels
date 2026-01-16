@@ -12,7 +12,9 @@ dependencies = [
     "seaborn",
     "tqdm",
     "scipy",
-    "setuptools",  # for torch.utils.cpp_extension
+    "setuptools", # for torch.utils.cpp_extension
+    "transformers==4.57.5",
+    "ipywidgets",
 ]
 
 [tool.setuptools]
