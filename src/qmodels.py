@@ -1,9 +1,11 @@
 """Model-level quantisation and benchmarking."""
 
-from dataclasses import dataclass
+import functools
 import gc
 import itertools
+import re
 import sys
+from dataclasses import dataclass
 
 import torch
 import transformers
@@ -18,7 +20,7 @@ import qkernels
 @dataclass
 class QuantisationConfig:
     bits: int
-    group_size: int
+    block_size: int
     kernel: str = "triton"
 
 
@@ -56,7 +58,7 @@ class QuantisedLinear(nn.Module):
         elements_per_byte = 8 // c.bits
 
         # Group scaling
-        weight_grouped = weight.unflatten(-1, (-1, c.group_size))
+        weight_grouped = weight.unflatten(-1, (-1, c.block_size))
         scale = (
             weight_grouped.abs().mean(dim=-1)
             if c.bits <= 2
@@ -90,7 +92,7 @@ def test_quantised_linear() -> None:
     w = torch.randn((192, 256), device="cuda", dtype=torch.bfloat16)
     x = torch.randn(100, w.shape[1], device="cuda", dtype=torch.bfloat16)
     for bits, tol in [(8, 1e-2), (4, 2e-1), (2, 0.75), (1, 1)]:
-        q = QuantisedLinear.create(w, QuantisationConfig(bits=bits, group_size=64))
+        q = QuantisedLinear.create(w, QuantisationConfig(bits=bits, block_size=64))
         y = q(x)
         qkernels._assert_rmsen(x @ w.T, y, tol=tol)
 
@@ -325,16 +327,40 @@ class BenchmarkSettings:
 
     def __str__(self) -> str:
         q = (
-            f"g={self.quantisation.group_size} {self.quantisation.bits}-bit"
+            f"b={self.quantisation.block_size} {self.quantisation.bits}-bit"
             if self.quantisation is not None
             else "16-bit"
         )
         return f"{self.model} batch={self.batch_size} {q}"
 
 
+def _estimate_fits_on_device(
+    settings: BenchmarkSettings, device: torch.device, dtype: torch.dtype
+) -> bool:
+    _, total_mem_bytes = torch.cuda.mem_get_info(device.index)
+    if m := re.search(r"(\d[0-9.]*)[bB]$", settings.model):
+        model_params_bn = float(m[1])
+        bytes_per_param = (
+            dtype.itemsize
+            if settings.quantisation is None
+            else settings.quantisation.bits / 8
+            + dtype.itemsize / settings.quantisation.block_size
+        )
+        estimated_model_bytes = model_params_bn * 1e9 * bytes_per_param
+        return estimated_model_bytes < total_mem_bytes * 0.8  # Leave some headroom
+    print(f"No size for model {settings.model} - assuming it fits", file=sys.stderr)
+    return True
+
+
+@functools.lru_cache()
+def get_custom_llama_tokenizer() -> transformers.PreTrainedTokenizerBase:
+    return transformers.AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B")
+
+
 def run_benchmark(settings: BenchmarkSettings, log: qbench.Log) -> None:
     gc.collect()
     torch.cuda.empty_cache()
+    device, dtype = torch.device("cuda"), torch.bfloat16
 
     out = dict(**settings.__dict__)
     if out["quantisation"] is not None:  # flatten
@@ -342,16 +368,18 @@ def run_benchmark(settings: BenchmarkSettings, log: qbench.Log) -> None:
     del out["quantisation"]
 
     try:
-        device, dtype = torch.device("cuda"), torch.bfloat16
+        if not _estimate_fits_on_device(settings, device, dtype):
+            raise RuntimeError(
+                "skipped; model size * bits/param is too large for the device"
+            )
+
         if settings.model.startswith("custom-llama-"):
             key = settings.model.replace("custom-llama-", "")
             # Create in float32, since bfloat16 RNG on CPU is slow
             model = transformers.AutoModelForCausalLM.from_config(
                 get_custom_llama_config(key), dtype=torch.float32
             )
-            tokenizer = transformers.AutoTokenizer.from_pretrained(
-                "meta-llama/Llama-3.2-3B"
-            )
+            tokenizer = get_custom_llama_tokenizer()
         else:
             model = transformers.AutoModelForCausalLM.from_pretrained(
                 settings.model, dtype=dtype
@@ -380,7 +408,7 @@ def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        default=["custom-llama-4B", "Qwen/Qwen3-14B"],
+        default=["custom-llama-4B"],
         nargs="+",
         help=f"Model ids, e.g. 'custom-llama-4B' (sizes: {list(custom_llama_configs)})"
         " or 'Qwen/Qwen3-4B'",
@@ -400,11 +428,11 @@ def _main() -> None:
         help="Quantisation bit widths",
     )
     parser.add_argument(
-        "--group-size",
+        "--block-size",
         default=[64],
         type=int,
         nargs="+",
-        help="Quantisation group sizes",
+        help="Quantisation block sizes",
     )
     parser.add_argument(
         "--reps",
@@ -418,13 +446,13 @@ def _main() -> None:
     test_quantised_linear()
 
     with qbench.Log("models") as log:
-        keys = ["model", "batch_size", "bits", "group_size"]
+        keys = ["model", "batch_size", "bits", "block_size"]
         for values in itertools.product(*(getattr(args, k) for k in keys)):
             s = dict(zip(keys, values))
             quantisation = (
                 None
                 if s["bits"] == 16
-                else QuantisationConfig(bits=s["bits"], group_size=s["group_size"])
+                else QuantisationConfig(bits=s["bits"], block_size=s["block_size"])
             )
             settings = BenchmarkSettings(
                 model=s["model"],

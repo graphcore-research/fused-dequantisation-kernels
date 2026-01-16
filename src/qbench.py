@@ -471,7 +471,7 @@ def _main() -> None:
         "-n", default=["k"], nargs="+", help="Dimension n (int or 'k' for square)"
     )
     parser.add_argument(
-        "-g", default=[64], type=int, nargs="+", help="Dimension g (group size)"
+        "-g", default=[64], type=int, nargs="+", help="Dimension g (block size)"
     )
     parser.add_argument(
         "-b", "--bits", default=[16, 4, 1], type=int, nargs="+", help="Bits per element"
