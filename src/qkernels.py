@@ -111,35 +111,40 @@ def kernel__mv_lut(
     out = tl.zeros((), dtype=tl.float32)
 
     for ik in range(0, tl.cdiv(k, BLOCK_ELEMENTS)):
+        # note: eviction_policy gives inconsistent improvements
         a = tl.load(
             a_ptrs,
             mask=offs_a + ik * BLOCK_ELEMENTS < k,
             other=0.0,
-            eviction_policy="evict_last",
         )
         bq = tl.load(
             b_ptrs,
             mask=offs_b + ik * BLOCK_SIZE < (k // ELEMENTS_PER_BYTE),
             other=0,
-            eviction_policy="evict_first",
         )
         # Note: since bq is always in [0, 255], no need to mask `bu` loads.
-        bu = tl.load(
-            lut_ptr
-            + ELEMENTS_PER_BYTE * tl.cast(bq[:, None], tl.int32)
-            + tl.arange(0, ELEMENTS_PER_BYTE),
-            eviction_policy="evict_last",
+        bu = tl.reshape(
+            tl.load(
+                lut_ptr
+                + ELEMENTS_PER_BYTE * tl.cast(bq[:, None], tl.int32)
+                + tl.arange(0, ELEMENTS_PER_BYTE),
+            ),
+            [BLOCK_ELEMENTS],
         )
         bs = tl.load(
             bs_ptrs,
             mask=offs_bs + ik * BLOCK_GROUPS < (k // GROUP_SIZE),
             other=0.0,
-            eviction_policy="evict_first",
         )
         b = tl.reshape(
             tl.reshape(bu, [BLOCK_GROUPS, GROUP_SIZE]) * bs[:, None], BLOCK_ELEMENTS
         )
-        out += tl.sum(a.to(tl.float32) * b.to(tl.float32))
+        # Unclear why, but {4b, 8b} prefer a different implementation to {1b, 2b}
+        if ELEMENTS_PER_BYTE >= 4:
+            out += tl.sum(a * b, dtype=tl.float32)
+        else:
+            out += tl.sum(a.to(tl.float32) * b.to(tl.float32))
+
         a_ptrs += BLOCK_ELEMENTS
         b_ptrs += BLOCK_SIZE
         bs_ptrs += BLOCK_GROUPS
