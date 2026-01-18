@@ -5,6 +5,7 @@ from torch import Tensor
 
 
 def _assert_rmsen(expected: Tensor, actual: Tensor, tol: float) -> None:
+    assert expected.shape == actual.shape
     expected_sse = expected.float().pow(2).sum()
     rmsen = (actual - expected).float().pow(2).sum().div(expected_sse).sqrt()
     assert rmsen < tol, f"rmsen={rmsen}"

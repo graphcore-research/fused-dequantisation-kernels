@@ -1,16 +1,19 @@
 """Model-level quantisation and benchmarking."""
 
+import copy
 import functools
 import gc
 import itertools
 import re
 import sys
 from dataclasses import dataclass
+from typing import Iterable, Literal
 
 import torch
 import transformers
 from torch import Tensor, nn
 
+import marlin
 import qbench
 import qkernels
 
@@ -21,7 +24,7 @@ import qkernels
 class QuantisationConfig:
     bits: int
     block_size: int
-    kernel: str = "triton"
+    kernel: Literal["triton", "torch.compile", "marlin", "marlin-lut"] = "triton"
 
 
 class QuantisedLinear(nn.Module):
@@ -32,6 +35,7 @@ class QuantisedLinear(nn.Module):
         weight_data: Tensor,
         scale: Tensor,
         lut: Tensor,
+        kernel: Literal["triton", "torch.compile"],
     ):
         super().__init__()
         self.in_features = in_features
@@ -39,10 +43,13 @@ class QuantisedLinear(nn.Module):
         self.weight_data = nn.Parameter(weight_data, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
         self.lut = nn.Buffer(lut)
+        self.kernel = kernel
 
     def forward(self, x: Tensor) -> Tensor:
         if x.ndim > 2:
             return self.forward(x.flatten(end_dim=-2)).unflatten(0, x.shape[:-1])
+        if self.kernel == "torch":
+            return qkernels.mm_lut_ref(x, self.weight_data, self.lut, self.scale)
         out = torch.empty(
             (x.shape[0], self.weight_data.shape[0]), device=x.device, dtype=x.dtype
         )
@@ -84,17 +91,28 @@ class QuantisedLinear(nn.Module):
             .sum(-1, dtype=torch.uint8)
         )
         lut = torch.cartesian_prod(*([lut1] * elements_per_byte)).view(256, -1)
-        return cls(weight.shape[1], weight.shape[0], weight_data, scale, lut)
+        return cls(*weight.T.shape, weight_data, scale, lut, kernel=c.kernel)
 
 
-def test_quantised_linear() -> None:
-    torch.manual_seed(100)
-    w = torch.randn((192, 256), device="cuda", dtype=torch.bfloat16)
-    x = torch.randn(100, w.shape[1], device="cuda", dtype=torch.bfloat16)
-    for bits, tol in [(8, 1e-2), (4, 2e-1), (2, 0.75), (1, 1)]:
-        q = QuantisedLinear.create(w, QuantisationConfig(bits=bits, block_size=64))
-        y = q(x)
-        qkernels._assert_rmsen(x @ w.T, y, tol=tol)
+def _create_marlin_layer(src: nn.Linear, c: QuantisationConfig) -> nn.Module:
+    assert c.bits == 4, "Marlin backend only supports 4-bit quantisation"
+    assert c.block_size in (64, 128), "Marlin backend requires block_size 64 or 128"
+    assert src.weight.dtype == torch.half, "Marlin backend requires float16 weights"
+    layer = marlin.Layer(
+        infeatures=src.in_features,
+        outfeatures=src.out_features,
+        groupsize=c.block_size,
+        is_linear={"marlin": True, "marlin-lut": False}[c.kernel],
+    ).cuda()
+    if not layer.is_linear:
+        centroids = torch.arange(-8, 8, dtype=torch.half, device="cuda")
+        layer.centroids[...] = torch.cartesian_prod(centroids, centroids).flip(1)
+    weight = src.weight.data
+    weight_grouped = weight.unflatten(-1, (-1, c.block_size))
+    scale = weight_grouped.abs().amax(dim=-1) / 7
+    scale.clamp_min_(1e-12)
+    layer.pack(src, scale)
+    return layer
 
 
 def quantise(
@@ -117,14 +135,50 @@ def quantise(
                 child.in_features % 64 == 0
             ), f"in_features must be multiple of 64, got {child.in_features}"
 
-            weight = child.weight.data.to(device=device, dtype=dtype)
-            setattr(module, name, QuantisedLinear.create(weight, config))
+            if config.kernel.startswith("marlin"):
+                setattr(module, name, _create_marlin_layer(child.to(dtype), config))
+            else:
+                weight = child.weight.data.to(device, dtype)
+                setattr(module, name, QuantisedLinear.create(weight, config))
 
         else:  # recurse
             quantise(child, config, device=device, dtype=dtype)
 
     module.to(device=device, dtype=dtype)  # convert non-quantised modules
     return module
+
+
+def test_quantise() -> None:
+    for bits, tol, kernels in [
+        (8, 0.01, ["triton", "torch.compile"]),
+        (4, 0.2, ["triton", "torch.compile", "marlin", "marlin-lut"]),
+        (2, 0.5, ["triton", "torch.compile"]),
+        (1, 1, ["triton", "torch.compile"]),
+    ]:
+        for kernel in kernels:
+            torch.manual_seed(100)
+            device = torch.device("cuda")
+            dtype = torch.float16 if kernel.startswith("marlin") else torch.bfloat16
+            x = torch.randn((100, 384))
+            ref_module = nn.Sequential(nn.Linear(384, 256, bias=False))
+            module = copy.deepcopy(ref_module)
+            quantise(
+                module,
+                QuantisationConfig(bits=bits, block_size=64, kernel=kernel),
+                device=device,
+                dtype=dtype,
+            )
+            expected = ref_module(x)
+            actual = module(x.to(device=device, dtype=dtype))
+            assert actual.device.type == device.type, f"bad device {actual.device.type}"
+            assert actual.dtype == dtype, f"bad dtype {actual.dtype}"
+            qkernels._assert_rmsen(expected, actual.cpu(), tol=tol)
+
+            # check stats, while we're here
+            assert count_ops(module) == 2 * 384 * 256, "bad ops count"
+            assert count_parameter_read_bytes(module) == (
+                (256 * 384 * bits) // 8 + 256 * (384 // 64) * dtype.itemsize
+            ), "bad bytes count"
 
 
 # Benchmarking helpers
@@ -194,6 +248,8 @@ def count_ops(model: transformers.PreTrainedModel) -> int:
     for module in model.modules():
         if isinstance(module, QuantisedLinear):
             ops += 2 * module.in_features * module.out_features
+        elif isinstance(module, marlin.Layer):
+            ops += 2 * module.k * module.n
         else:
             ops += sum(2 * p.numel() for p in module.parameters(recurse=False))
     return ops
@@ -203,11 +259,16 @@ def count_parameter_read_bytes(model: transformers.PreTrainedModel) -> int:
     """Approximate bytes read per token."""
     bytes_r = 0
     for module in model.modules():
-        # Ignore sparse modules (embeddings), with negligible reads
-        if not isinstance(module, nn.Embedding):
+        if isinstance(module, marlin.Layer):
+            # Like QuantisedLinear, don't count centroids (or workspace), only elements & scales
+            bytes_r += sum(b.numel() * b.element_size() for b in [module.B, module.s])
+        elif isinstance(module, nn.Embedding):
+            pass  # Ignore sparse modules (embeddings), with negligible reads
+        else:
             bytes_r += sum(
                 p.numel() * p.element_size() for p in module.parameters(recurse=False)
             )
+
     return bytes_r
 
 
@@ -327,7 +388,9 @@ class BenchmarkSettings:
 
     def __str__(self) -> str:
         q = (
-            f"b={self.quantisation.block_size} {self.quantisation.bits}-bit"
+            f"b={self.quantisation.block_size}"
+            f" {self.quantisation.bits}-bit"
+            f" {self.quantisation.kernel}"
             if self.quantisation is not None
             else "16-bit"
         )
@@ -360,7 +423,13 @@ def get_custom_llama_tokenizer() -> transformers.PreTrainedTokenizerBase:
 def run_benchmark(settings: BenchmarkSettings, log: qbench.Log) -> None:
     gc.collect()
     torch.cuda.empty_cache()
-    device, dtype = torch.device("cuda"), torch.bfloat16
+    device = torch.device("cuda")
+    if settings.quantisation is not None and settings.quantisation.kernel.startswith(
+        "marlin"
+    ):
+        dtype = torch.float16
+    else:
+        dtype = torch.bfloat16
 
     out = dict(**settings.__dict__)
     if out["quantisation"] is not None:  # flatten
@@ -389,17 +458,32 @@ def run_benchmark(settings: BenchmarkSettings, log: qbench.Log) -> None:
         out.update(parameters=sum(p.numel() for p in model.parameters()))
         if settings.quantisation is not None:
             quantise(model, settings.quantisation, device=device, dtype=dtype)
-
-        model.to(device=device, dtype=dtype)
+        else:
+            model.to(device=device, dtype=dtype)
         result = benchmark(model, tokenizer, settings.batch_size, settings.reps)
         out.update(result.__dict__)
-        print(f"{str(settings):>40}:  {result}", file=sys.stderr)
+        print(f"{str(settings):>52}:  {result}", file=sys.stderr)
 
     except Exception as e:
         out.update(error=repr(e))
-        print(f"{str(settings):>40}:  ERROR {e}", file=sys.stderr)
+        print(f"{str(settings):>52}:  ERROR {e}", file=sys.stderr)
 
     log(out)
+
+
+def _quantisation_configs(
+    bits: list[int], block_sizes: list[int], kernels: list[str]
+) -> Iterable[QuantisationConfig]:
+    if 16 in bits:
+        yield None  # 16-bit (no quantisation)
+    for b in bits:
+        if b < 16:
+            for block_size in block_sizes:
+                for kernel in kernels:
+                    if not (kernel.startswith("marlin") and b != 4):
+                        yield QuantisationConfig(
+                            bits=b, block_size=block_size, kernel=kernel
+                        )
 
 
 def _main() -> None:
@@ -432,7 +516,15 @@ def _main() -> None:
         default=[64],
         type=int,
         nargs="+",
-        help="Quantisation block sizes",
+        help="Quantisation block sizes (ignored for 16-bit)",
+    )
+    parser.add_argument(
+        "--kernel",
+        default=["triton", "marlin-lut"],
+        choices=["triton", "torch.compile", "marlin", "marlin-lut"],
+        type=str,
+        nargs="+",
+        help="Kernel implementation(s) to use (ignored for 16-bit)",
     )
     parser.add_argument(
         "--reps",
@@ -443,24 +535,20 @@ def _main() -> None:
     args = parser.parse_args()
     transformers.utils.logging.disable_progress_bar()
 
-    test_quantised_linear()
+    test_quantise()
 
     with qbench.Log("models") as log:
-        keys = ["model", "batch_size", "bits", "block_size"]
-        for values in itertools.product(*(getattr(args, k) for k in keys)):
-            s = dict(zip(keys, values))
-            quantisation = (
-                None
-                if s["bits"] == 16
-                else QuantisationConfig(bits=s["bits"], block_size=s["block_size"])
-            )
-            settings = BenchmarkSettings(
-                model=s["model"],
-                batch_size=s["batch_size"],
-                quantisation=quantisation,
-                reps=args.reps,
-            )
-            run_benchmark(settings, log)
+        for model, batch_size in itertools.product(args.model, args.batch_size):
+            for config in _quantisation_configs(
+                args.bits, args.block_size, args.kernel
+            ):
+                settings = BenchmarkSettings(
+                    model=model,
+                    batch_size=batch_size,
+                    quantisation=config,
+                    reps=args.reps,
+                )
+                run_benchmark(settings, log)
 
 
 if __name__ == "__main__":
