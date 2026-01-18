@@ -6,7 +6,8 @@ __pycache__
 .vscode
 
 /local
-/notebooks/results
+/notebooks/out
+/notebooks/paper
 /out/dev
 /out/profiles
 /src/experimental/build

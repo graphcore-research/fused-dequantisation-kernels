@@ -464,7 +464,7 @@ def _main() -> None:
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-m", default=[1, 16, 64, 256], type=int, nargs="+", help="Dimension m"
+        "-m", default=[1, 4, 16, 64, 256], type=int, nargs="+", help="Dimension m"
     )
     parser.add_argument("-k", default=[4096], type=int, nargs="+", help="Dimension k")
     parser.add_argument(

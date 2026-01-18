@@ -415,7 +415,7 @@ def _main() -> None:
     )
     parser.add_argument(
         "--batch-size",
-        default=[1, 16, 64],
+        default=[1],
         type=int,
         nargs="+",
         help="Generation batch sizes",

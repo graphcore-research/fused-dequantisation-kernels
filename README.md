@@ -2,9 +2,11 @@
 
 ```sh
 python src/qbench.py
+python src/qmodels.py
 
-# Long run
+# Long runs
 python src/qbench.py --exclude '' -b 16 8 4 2 1 -k 8192 6144 4096 3072
+python src/qmodels.py --model custom-llama-4B custom-llama-11B custom-llama-30B --batch-size 1 4 16 64
 ```
 
 First-time setup:
