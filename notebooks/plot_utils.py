@@ -3,21 +3,31 @@
 
 """Generate paper-ready plots"""
 
+import inspect
 import logging
+import math
+import re
 import subprocess
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import matplotlib
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-
 PALETTE = sns.color_palette("Dark2")
 SEQ_PALETTE = sns.color_palette("flare", as_cmap=True)
-DISPLAY_NAMES = {}
+DISPLAY_NAMES = {
+    "k": "$k$",
+    "tflops": "TFLOP/s",
+    "gb_s": "GB/s",
+    "tokens_s": "Tokens/s",
+    "impl": "Implementation",
+    "element_bits": "Element Bits",
+    "parameters": "Parameter Count",
+}
 
 
 def display_name(s: str) -> str:
@@ -76,17 +86,31 @@ def tidy(figure: matplotlib.figure.Figure) -> None:
             text.set_text(display_name(text.get_text()))
 
 
-def fmt_latex_booktabs(df: pd.DataFrame, cols: dict[str, str]) -> str:
+def fmt_latex_booktabs(
+    df: pd.DataFrame,
+    cols: dict[str, str],
+    align: str | None = None,
+    nan_str: str = "$-$",
+) -> str:
     """Format as a booktabs table."""
 
     def fmt_value(v: Any) -> str:
-        if isinstance(v, float):
-            return f"{v:.3g}"
+        if isinstance(v, int):
+            return f"${v}$"
+        elif isinstance(v, float):
+            if math.isnan(v):
+                return nan_str
+            return f"${v:.3g}$"
         else:
             return str(v)
 
-    s = r"\begin{tabular}" + "{" + "l" * len(cols) + "}" + r" \toprule"
-    s += "\n  " + " & ".join(map(fmt_value, cols.values())) + r" \\\midrule"
+    if align is not None:
+        assert len(align) == len(cols), "align length must match number of columns"
+
+    col_titles = [fmt_value(value or display_name(key)) for key, value in cols.items()]
+
+    s = r"\begin{tabular}" + "{" + (align or "l" * len(cols)) + "}" + r" \toprule"
+    s += "\n  " + " & ".join(col_titles) + r" \\\midrule"
     for _, row in df.iterrows():
         s += "\n  " + " & ".join(fmt_value(row[col]) for col in cols) + r" \\"
     s += "\n" + r"\bottomrule"
@@ -108,7 +132,7 @@ def _check_overleaf_cloned() -> bool:
 
 def push_to_paper() -> None:
     for git_cmd in [
-        "add figures/",
+        "add code/ figures/ tables/",
         "commit -m 'Update figures' --quiet",
         "pull --rebase --quiet",
         "push --quiet",
@@ -124,5 +148,24 @@ def save(name: str, push: bool = True) -> None:
     """Save and push a figure to the paper."""
     if _check_overleaf_cloned():
         plt.savefig(OVERLEAF / "figures" / f"{name}.pdf", bbox_inches="tight")
+        if push:
+            push_to_paper()
+
+
+def save_table(name: str, df: pd.DataFrame, push: bool = True, **args: Any) -> str:
+    if _check_overleaf_cloned():
+        (OVERLEAF / "tables" / f"{name}.tex").write_text(fmt_latex_booktabs(df, **args))
+        if push:
+            push_to_paper()
+
+
+def save_code(fn: Callable[..., Any], push: bool = True) -> None:
+    body = inspect.getsource(fn).splitlines()[1:]
+    body = [re.sub(r"^    ", "", x) for x in body]
+    body = [x for x in body if "# IGNORE" not in x]
+    code = "\n".join(body) + "\n"
+
+    if _check_overleaf_cloned():
+        (OVERLEAF / "code" / f"{fn.__name__}.py").write_text(code)
         if push:
             push_to_paper()

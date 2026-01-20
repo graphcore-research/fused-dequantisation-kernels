@@ -424,6 +424,8 @@ def get_custom_llama_tokenizer() -> transformers.PreTrainedTokenizerBase:
 def run_benchmark(settings: BenchmarkSettings, log: qbench.Log) -> None:
     gc.collect()
     torch.cuda.empty_cache()
+    torch.compiler.reset()
+    torch._dynamo.config.recompile_limit = 64
     device = torch.device("cuda")
     if settings.quantisation is not None and settings.quantisation.kernel.startswith(
         "marlin"
