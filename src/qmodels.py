@@ -48,8 +48,9 @@ class QuantisedLinear(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if x.ndim > 2:
             return self.forward(x.flatten(end_dim=-2)).unflatten(0, x.shape[:-1])
-        if self.kernel == "torch":
+        if self.kernel == "torch.compile":
             return qkernels.mm_lut_ref(x, self.weight_data, self.lut, self.scale)
+        assert self.kernel == "triton"
         out = torch.empty(
             (x.shape[0], self.weight_data.shape[0]), device=x.device, dtype=x.dtype
         )
@@ -529,7 +530,7 @@ def _main() -> None:
     parser.add_argument(
         "--reps",
         type=int,
-        default=64,
+        default=100,
         help="Number of generation steps to measure",
     )
     args = parser.parse_args()
