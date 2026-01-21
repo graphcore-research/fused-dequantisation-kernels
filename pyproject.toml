@@ -4,17 +4,21 @@ version = "0.1.0"
 description = "Dequantisation kernel benchmarks"
 requires-python = ">=3.10"
 dependencies = [
+    "setuptools", # for torch.utils.cpp_extension
+    "tqdm",
     "torch",
     "triton",
-    "pandas",
-    "ipykernel",
-    "matplotlib",
-    "seaborn",
-    "tqdm",
-    "scipy",
-    "setuptools", # for torch.utils.cpp_extension
     "transformers==4.57.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel",
     "ipywidgets",
+    "matplotlib",
+    "pandas",
+    "scipy",
+    "seaborn",
 ]
 
 [tool.setuptools]

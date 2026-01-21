@@ -13,7 +13,7 @@ First-time setup:
 
 ```sh
 sudo apt install ninja-build pybind11-dev
-uv sync
+uv sync --extra dev
 echo 'export PYTHONPATH=$(dirname ${VIRTUAL_ENV})/src' >> .venv/bin/activate
 ```
 
