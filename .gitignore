@@ -10,4 +10,5 @@ __pycache__
 /notebooks/paper
 /out/dev
 /out/profiles
-/src/experimental/build
+/src/experimental/cpu/build
+/src/experimental/cuda/build

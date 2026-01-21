@@ -20,12 +20,11 @@ echo 'export PYTHONPATH=$(dirname ${VIRTUAL_ENV})/src' >> .venv/bin/activate
 ## Experimental code
 
 ```sh
-# Build and run src/experimental/bench.cu
-ninja -C src/experimental build/bench
-./src/experimental/build/bench
+ninja -C src/experimental/cpu build/bench
+./src/experimental/cpu/build/bench
 
-# Note: build ptx
-ninja -C src/experimental build/bench.ptx
+ninja -C src/experimental/cuda build/bench build/bench.ptx
+./src/experimental/cuda/build/bench
 ```
 
 ## Profiling
@@ -34,7 +33,6 @@ Requires `ncu`, [NVIDIA Nsight Compute](https://developer.nvidia.com/tools-overv
 
 ```sh
 mkdir -p out/profiles
-sudo $(which ncu) --kernel-name="regex:.*kernel__mv.*" --launch-skip=100 --launch-count=10 -o out/profiles/cuda_mv_lut8_4b ./src/experimental/build/bench mv_4b_lut8 4096
 sudo $(which ncu) --kernel-name="regex:.*kernel__mv.*" --launch-skip=100 --launch-count=10 -o out/profiles/mv_lut8_4b $(which python) src/qbench.py --profile mv_lut8 -b 4
 ```
 

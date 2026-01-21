@@ -1,0 +1,19 @@
+cxx = clang++
+flags = -fopenmp -stdlib=libc++
+cflags = -O3 -DNDEBUG -mcpu=native -std=c++20 -g $
+  -Wall -Wextra -Wconversion -Wdouble-promotion -Werror -fdiagnostics-color=always
+linkflags =
+libs =
+
+rule compile
+  command = $cxx $flags $cflags -MD -MF $out.d -c -o $out $in
+  description = CXX $out
+  deps = gcc
+  depfile = $out.d
+
+rule link
+  command = $cxx $flags $linkflags -o $out $in $libs
+  description = LINK $out
+
+build build/bench.o: compile bench.cpp
+build build/bench: link build/bench.o
