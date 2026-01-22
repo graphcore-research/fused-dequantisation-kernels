@@ -828,90 +828,12 @@ void benchmark_mm() {
 // ----------------------------------------------------------------------------
 // Driver program
 
-namespace demo {
-
-void demo_vtbl2_u8() {
-    // vtbl2_u8 performs table lookup using a 16-byte table stored in two uint8x8_t registers
-    // Create a 16-byte lookup table: [0, 1, 2, ..., 15]
-    uint8_t table_data[16];
-    for (int i = 0; i < 16; i++) {
-        table_data[i] = uint8_t(i * 10);  // e.g., [0, 10, 20, ..., 150]
-    }
-    uint8x8x2_t table;
-    table.val[0] = vld1_u8(&table_data[0]);  // first 8 bytes
-    table.val[1] = vld1_u8(&table_data[8]);  // next 8 bytes
-
-    // Create indices to lookup: [3, 7, 0, 15, 2, 8, 1, 12]
-    uint8_t indices_data[8] = {3, 7, 0, 15, 2, 8, 1, 12};
-    uint8x8_t indices = vld1_u8(indices_data);
-
-    // Perform table lookup
-    uint8x8_t result = vtbl2_u8(table, indices);
-
-    // Print results
-    uint8_t result_data[8];
-    vst1_u8(result_data, result);
-    std::cerr << "vtbl2_u8 demo: indices -> values" << std::endl;
-    for (int i = 0; i < 8; i++) {
-        std::cerr << "  " << int(indices_data[i]) << " -> " << int(result_data[i]) << std::endl;
-    }
-}
-
-void demo_lut4_to_bf16() {
-    // Map 8 4-bit indices (packed in 32 bits) through 16-entry LUT to bfloat16x8_t
-
-    // 16-entry lookup table of bf16 values (32 bytes total)
-    bf16 lut_data[16];
-    for (int i = 0; i < 16; i++) {
-        lut_data[i] = bf16(float(i) - 8.0f);
-    }
-
-    // Load LUT as uint8 for vtbl4_u8 (covers 32 bytes)
-    const uint8_t* lut_u8 = reinterpret_cast<const uint8_t*>(lut_data);
-    uint8x8x4_t lut_table;
-    lut_table.val[0] = vld1_u8(&lut_u8[0]);
-    lut_table.val[1] = vld1_u8(&lut_u8[8]);
-    lut_table.val[2] = vld1_u8(&lut_u8[16]);
-    lut_table.val[3] = vld1_u8(&lut_u8[24]);
-
-    uint32_t packed_indices = 0x0123fedc;  // 8 4-bit indices
-
-    // Build index vectors (each bf16 is 2 bytes, so multiply by 2)
-    uint8_t indices_lo[8], indices_hi[8];
-    for (int i = 0; i < 8; i++) {
-        uint8_t idx = (packed_indices >> (4 * i)) & 0xF;
-        indices_lo[i] = idx * 2;      // low byte
-        indices_hi[i] = idx * 2 + 1;  // high byte
-    }
-
-    // Lookup both bytes and interleave
-    uint8x8_t result_lo = vtbl4_u8(lut_table, vld1_u8(indices_lo));
-    uint8x8_t result_hi = vtbl4_u8(lut_table, vld1_u8(indices_hi));
-    uint8x8x2_t interleaved = vzip_u8(result_lo, result_hi);
-    bfloat16x8_t result =
-        vreinterpretq_bf16_u8(vcombine_u8(interleaved.val[0], interleaved.val[1]));
-
-    // Print results
-    bf16 result_data[8];
-    vst1q_bf16(result_data, result);
-    std::cerr << "LUT4 to bf16 demo: indices -> values" << std::endl;
-    for (int i = 0; i < 8; i++) {
-        uint8_t idx = (packed_indices >> (4 * i)) & 0xF;
-        std::cerr << "  " << int(idx) << " -> " << float(result_data[i]) << std::endl;
-    }
-}
-
-}  // namespace demo
-
 int main() {
     // auto threads = 1;
     auto threads = std::thread::hardware_concurrency();
 
     omp_set_num_threads(int(threads));
     std::cerr << std::format("# Using {} threads\n\n", threads);
-
-    // demo::demo_vtbl2_u8();
-    // demo::demo_lut4_to_bf16();
 
     tests::test_all();
 
