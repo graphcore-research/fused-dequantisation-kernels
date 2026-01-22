@@ -50,6 +50,16 @@ std::ostream& operator<<(std::ostream& out, const std::vector<T>& v) {
     return out;
 }
 
+std::ostream& operator<<(std::ostream& out, uint8x8_t v) {
+    out << "[";
+    out << int(vget_lane_u8(v, 0)) << ", " << int(vget_lane_u8(v, 1)) << ", "
+        << int(vget_lane_u8(v, 2)) << ", " << int(vget_lane_u8(v, 3)) << ", "
+        << int(vget_lane_u8(v, 4)) << ", " << int(vget_lane_u8(v, 5)) << ", "
+        << int(vget_lane_u8(v, 6)) << ", " << int(vget_lane_u8(v, 7));
+    out << "]";
+    return out;
+}
+
 // ----------------------------------------------------------------------------
 // Kernels
 
@@ -100,7 +110,6 @@ NOINLINE void mv(const bf16* __restrict__ a,  // [dK]
     for (auto n = 0ull; n < dN; ++n) {
         out[n] = bf16(_dot(a, &b[n * dK], dK));
     }
-    return;
 }
 
 template <uint BlockM, uint BlockN>
@@ -279,7 +288,72 @@ NOINLINE void mv_lut8(const bf16* __restrict__ a,         // [dK]
     for (auto n = 0ull; n < dN; ++n) {
         out[n] = bf16(_dot_lut8(a, &b[n * (dK / 8)], lut8, &bs[n * (dK / dG)], dK, dG));
     }
-    return;
+}
+
+// LUT4
+
+template <uint64_t dG>
+float _dot_lut(const bf16* __restrict__ a,
+               const uint32_t* __restrict__ b,
+               const uint8x8x2_t lut_lo,  // [16 x uint8]
+               const uint8x8x2_t lut_hi,  // [16 x uint8]
+               const bf16* __restrict__ bs,
+               const uint64_t dK) {
+    float32x4_t acc = vmovq_n_f32(0.0f);
+    float32x4_t accu = vmovq_n_f32(0.0f);  // unscaled
+    for (auto g = 0u; g < (dK / dG); ++g) {
+#pragma unroll
+        for (auto i = 0u; i < (dG / 8); ++i) {
+            // Load 8x bf16 from a and 8x 4-bit indices from b
+            auto k = g * dG + i * 8;
+            auto ai = vld1q_bf16(a + k);
+            uint32_t biq = b[k / 8];
+
+            // Unpack 4-bit indices and lookup
+
+            // Bad order, requires weight permutation (but slightly faster)
+            // uint8x8_t idx = vcreate_u8((uint64_t(biq) & 0x0F0F0F0Full) |
+            //                            ((uint64_t(biq) & 0xF0F0F0F0ull) << 28));
+
+            auto idx = vzip_u8(vcreate_u8(uint64_t(biq & 0x0F0F0F0Full)),
+                               vcreate_u8(uint64_t((biq & 0xF0F0F0F0ull) >> 4)))
+                           .val[0];
+
+            uint8x8x2_t z = vzip_u8(vtbl2_u8(lut_lo, idx), vtbl2_u8(lut_hi, idx));
+            bfloat16x8_t biu = vreinterpretq_bf16_u8(vcombine_u8(z.val[0], z.val[1]));
+
+            accu = vbfdotq_f32(accu, ai, biu);
+        }
+        auto bsi = bs[g];
+        acc = vmlaq_f32(acc, accu, vdupq_n_f32(float(bsi)));
+        accu = vmovq_n_f32(0.0f);
+    }
+    return vaddvq_f32(acc);
+}
+
+template <uint64_t dG>
+NOINLINE void mv_lut(const bf16* __restrict__ a,      // [dK]
+                     const uint32_t* __restrict__ b,  // [dN * (dK/8)]
+                     const bf16* __restrict__ lut,    // [16]
+                     const bf16* __restrict__ bs,     // [dN * (dK/dG)]
+                     const uint64_t dK,
+                     const uint64_t dN,
+                     bf16* __restrict__ out) {  // [dN]
+    assert(dK % dG == 0);
+    assert(dG % 8 == 0);
+
+    // Load LUT
+    uint8x8x2_t lut_lo, lut_hi;
+    for (auto i = 0u; i < 16; ++i) {
+        auto v = reinterpret_cast<const uint16_t*>(&lut[0])[i];
+        lut_lo.val[i / 8][i % 8] = static_cast<uint8_t>(v & 0xFF);
+        lut_hi.val[i / 8][i % 8] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    }
+
+#pragma omp parallel for
+    for (auto n = 0ull; n < dN; ++n) {
+        out[n] = bf16(_dot_lut<dG>(a, &b[n * (dK / 8)], lut_lo, lut_hi, &bs[n * (dK / dG)], dK));
+    }
 }
 
 }  // namespace kernels
@@ -489,9 +563,9 @@ struct ScaledTensor {
 };
 
 void test_block_quantise() {
-    auto dK = 64ull, dN = 8ull;
-    auto block_size = 16ull;
-    auto bits_per_element = 4ull;
+    uint64_t dK = 64, dN = 8, bits_per_element = 4;
+    // uint64_t dK = 32, dN = 1, bits_per_element = 4;
+    constexpr uint64_t dG = 16;
 
     std::default_random_engine rng(200);
     auto a = randn<bf16>(dK, rng);
@@ -500,24 +574,42 @@ void test_block_quantise() {
 
     kernels::mv(a.data(), b.data(), dK, dN, original.data());
 
-    auto bq = ScaledTensor::quantise_linear(b, block_size, bits_per_element);
+    auto bq = ScaledTensor::quantise_linear(b, dG, bits_per_element);
     auto br = bq.dequantise();
     kernels::mv(a.data(), br.data(), dK, dN, ref.data());
 
     auto lut8 = bq.lutN<2>();
     kernels::mv_lut8(a.data(), reinterpret_cast<const uint32_t*>(bq.data.data()),
-                     reinterpret_cast<const uint32_t*>(lut8.data()), bq.scale.data(), dK, dN,
-                     block_size, actual.data());
+                     reinterpret_cast<const uint32_t*>(lut8.data()), bq.scale.data(), dK, dN, dG,
+                     actual.data());
+
+    // std::cerr << "bq: " << std::hex << std::vector<int>(bq.data.begin(), bq.data.end()) << "\n\n"
+    //           << std::dec;
+
+    std::vector<bf16> actual4(dN);
+    kernels::mv_lut<dG>(a.data(), reinterpret_cast<const uint32_t*>(bq.data.data()), bq.lut.data(),
+                        bq.scale.data(), dK, dN, actual4.data());
 
     EXPECT_CLOSE(ref, actual, 0.001);
     EXPECT_CLOSE(original, actual, 0.2);  // depends on bits_per_element
+    EXPECT_CLOSE(ref, actual4, 0.001);
+    EXPECT_CLOSE(original, actual4, 0.2);  // depends on bits_per_element
 }
 
 void test_all() {
     std::cerr << "### Running tests\n\n";
-    test_kernel_mm();
-    test_block_quantise();
-    std::cerr << "---> Tests passed\n\n" << std::flush;
+    auto success = true;
+    for (auto test : {&test_kernel_mm, &test_block_quantise}) {
+        try {
+            test();
+        } catch (const std::exception& e) {
+            std::cerr << "--> Test failed: " << e.what() << "\n\n" << std::flush;
+            success = false;
+        }
+    }
+    if (success) {
+        std::cerr << "---> Tests passed\n\n" << std::flush;
+    }
 }
 
 }  // namespace tests
@@ -635,6 +727,7 @@ void benchmark_mv_lut8() {
 
     const std::vector<std::tuple<uint64_t, uint64_t>> sizes = {
         {4096, 4096},
+        {8192, 8192},
     };
     const uint64_t reps = 16;
 
@@ -656,6 +749,40 @@ void benchmark_mv_lut8() {
         });
         double bytes =
             double(dK * sizeof(bf16) + (dK / 8) * dN * sizeof(uint32_t) + dN * sizeof(bf16));
+        double gbs = bytes / (s.avg_time * 1e9);
+        std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n",
+                                 std::format("{} x {}", dK, dN), s.avg_time * 1e3, gbs);
+    }
+    std::cerr << "\n";
+}
+
+void benchmark_mv_lut() {
+    std::cerr << "### benchmark_mv_lut\n";
+
+    const std::vector<std::tuple<uint64_t, uint64_t>> sizes = {
+        {4096, 4096},
+        {8192, 8192},
+    };
+    const uint64_t reps = 16;
+    constexpr uint64_t dG = 64;
+
+    for (const auto& [dK, dN] : sizes) {
+        // Allocate
+        auto copies = (1ull << 30) / (dK * dN * sizeof(bf16));
+        std::vector<bf16> a(copies * dK, bf16(0.5f));
+        std::vector<uint32_t> b(copies * dN * (dK / 8), 0xfedc0123);
+        std::vector<bf16> bs(copies * dN * (dK / dG), bf16(0.25f));
+        std::vector<bf16> out(copies * dN);
+        std::vector<bf16> lut(16, bf16(10.0f));
+
+        // Benchmark
+        auto s = measure_time(reps, [&](uint64_t i) {
+            auto idx = i % copies;
+            kernels::mv_lut<dG>(&a[idx * dK], &b[idx * dN * (dK / 8)], &lut[0],
+                                &bs[idx * dN * (dK / dG)], dK, dN, &out[idx * dN]);
+        });
+        double bytes = double(dK * sizeof(bf16) + dN * (dK / 8) * sizeof(uint32_t) +
+                              dN * (dK / dG) * sizeof(bf16) + dN * sizeof(bf16));
         double gbs = bytes / (s.avg_time * 1e9);
         std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n",
                                  std::format("{} x {}", dK, dN), s.avg_time * 1e3, gbs);
@@ -779,6 +906,7 @@ void demo_lut4_to_bf16() {
 int main() {
     // auto threads = 1;
     auto threads = std::thread::hardware_concurrency();
+
     omp_set_num_threads(int(threads));
     std::cerr << std::format("# Using {} threads\n\n", threads);
 
@@ -791,6 +919,7 @@ int main() {
     benchmarks::benchmark_reduce_sum();
     benchmarks::benchmark_mv();
     benchmarks::benchmark_mv_lut8();
+    benchmarks::benchmark_mv_lut();
     benchmarks::benchmark_mm();
 
     return 0;
