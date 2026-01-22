@@ -8,6 +8,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <format>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -315,17 +316,14 @@ void expect_eq(const std::vector<bf16>& expected,
                const char* file,
                int line) {
     if (expected.size() != actual.size()) {
-        std::ostringstream str;
-        str << "EXPECT_EQ size mismatch: " << expected.size() << " != " << actual.size() << " at "
-            << file << ":" << line << std::endl;
-        throw std::runtime_error(str.str());
+        throw std::runtime_error(std::format("EXPECT_EQ size mismatch: {} != {} at {}:{}\n",
+                                             expected.size(), actual.size(), file, line));
     }
     for (size_t i = 0; i < expected.size(); ++i) {
         if (std::abs(float(expected[i]) - float(actual[i])) > tol * std::abs(float(expected[i]))) {
-            std::ostringstream str;
-            str << "EXPECT_EQ value mismatch at index " << i << ": " << float(expected[i])
-                << " != " << float(actual[i]) << " at " << file << ":" << line << std::endl;
-            throw std::runtime_error(str.str());
+            throw std::runtime_error(
+                std::format("EXPECT_EQ value mismatch at index {}: {} != {} at {}:{}\n", i,
+                            float(expected[i]), float(actual[i]), file, line));
         }
     }
 }
@@ -349,12 +347,14 @@ void expect_close(const std::vector<bf16>& expected,
                   double tol,
                   const char* file,
                   int line) {
+    if (expected.size() != actual.size()) {
+        throw std::runtime_error(std::format("EXPECT_CLOSE size mismatch: {} != {} at {}:{}\n",
+                                             expected.size(), actual.size(), file, line));
+    }
     auto error = rmse_norm(expected, actual);
     if (error > tol) {
-        std::ostringstream str;
-        str << "EXPECT_CLOSE failed: RMSE norm " << error << " > " << tol << " at " << file << ":"
-            << line << std::endl;
-        throw std::runtime_error(str.str());
+        throw std::runtime_error(std::format("EXPECT_CLOSE failed: RMSE norm {} > {} at {}:{}\n",
+                                             error, tol, file, line));
     }
 }
 
@@ -558,7 +558,7 @@ TimingStats measure_time(uint64_t reps, const std::function<void(uint64_t)>& fn)
 }
 
 void benchmark_memcpy() {
-    std::cerr << "### benchmark_memcpy" << std::endl;
+    std::cerr << "### benchmark_memcpy\n";
 
     const uint64_t bytes_to_copy = 256 * 1024 * 1024;
     const uint64_t copies = (1ull << 30) / bytes_to_copy;  // to avoid caching effects
@@ -575,18 +575,13 @@ void benchmark_memcpy() {
         kernels::memcpy(&dst[idx * n_elems], &src[idx * n_elems], n_elems);
     });
     double gbs = 2 * double(bytes_to_copy) / (s.avg_time * 1e9);
-    std::cerr << std::left << std::setw(20)
-              << (std::to_string(bytes_to_copy / (1024 * 1024)) + " MB") << std::right
-              << std::setw(15) << std::fixed << std::setprecision(3) << (s.avg_time * 1e3)
-              << " ms"  //
-              << std::right << std::setw(15) << std::fixed << std::setprecision(1) << gbs
-              << " GB/s"  //
-              << "\n"
-              << std::endl;
+    std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n\n",
+                             std::to_string(bytes_to_copy / (1024 * 1024)) + " MB",
+                             s.avg_time * 1e3, gbs);
 }
 
 void benchmark_reduce_sum() {
-    std::cerr << "### benchmark_reduce_sum" << std::endl;
+    std::cerr << "### benchmark_reduce_sum\n";
 
     const uint64_t n_elems = 16 * 1024 * 1024;
     const uint64_t copies = (1ull << 30) / (n_elems * sizeof(bf16));
@@ -602,17 +597,12 @@ void benchmark_reduce_sum() {
         kernels::reduce_sum(&src[idx * n_elems], n_elems, &result);
     });
     double gbs = double(n_elems * sizeof(bf16)) / (s.avg_time * 1e9);
-    std::cerr << std::left << std::setw(20) << std::to_string(n_elems) + " elements"  //
-              << std::right << std::setw(15) << std::fixed << std::setprecision(3)
-              << (s.avg_time * 1e3) << " ms"  //
-              << std::right << std::setw(15) << std::fixed << std::setprecision(1) << gbs
-              << " GB/s"  //
-              << "\n"
-              << std::endl;
+    std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n\n",
+                             std::format("{} elements", n_elems), s.avg_time * 1e3, gbs);
 }
 
 void benchmark_mv() {
-    std::cerr << "### benchmark_mv" << std::endl;
+    std::cerr << "### benchmark_mv\n";
 
     const std::vector<std::tuple<uint64_t, uint64_t>> sizes = {
         {4096, 4096},
@@ -634,19 +624,14 @@ void benchmark_mv() {
         });
         double bytes = double(dK + dK * dN + dN) * sizeof(bf16);
         double gbs = bytes / (s.avg_time * 1e9);
-        std::cerr << std::left << std::setw(20)
-                  << (std::to_string(dK) + "x" + std::to_string(dN))  //
-                  << std::right << std::setw(15) << std::fixed << std::setprecision(3)
-                  << (s.avg_time * 1e3) << " ms"  //
-                  << std::right << std::setw(15) << std::fixed << std::setprecision(1) << gbs
-                  << " GB/s"  //
-                  << std::endl;
+        std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n",
+                                 std::format("{} x {}", dK, dN), s.avg_time * 1e3, gbs);
     }
-    std::cerr << std::endl;
+    std::cerr << "\n";
 }
 
 void benchmark_mv_lut8() {
-    std::cerr << "### benchmark_mv_lut8" << std::endl;
+    std::cerr << "### benchmark_mv_lut8\n";
 
     const std::vector<std::tuple<uint64_t, uint64_t>> sizes = {
         {4096, 4096},
@@ -672,19 +657,14 @@ void benchmark_mv_lut8() {
         double bytes =
             double(dK * sizeof(bf16) + (dK / 8) * dN * sizeof(uint32_t) + dN * sizeof(bf16));
         double gbs = bytes / (s.avg_time * 1e9);
-        std::cerr << std::left << std::setw(20)
-                  << (std::to_string(dK) + "x" + std::to_string(dN))  //
-                  << std::right << std::setw(15) << std::fixed << std::setprecision(3)
-                  << (s.avg_time * 1e3) << " ms"  //
-                  << std::right << std::setw(15) << std::fixed << std::setprecision(1) << gbs
-                  << " GB/s"  //
-                  << std::endl;
+        std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n",
+                                 std::format("{} x {}", dK, dN), s.avg_time * 1e3, gbs);
     }
-    std::cerr << std::endl;
+    std::cerr << "\n";
 }
 
 void benchmark_mm() {
-    std::cerr << "### benchmark_mm" << std::endl;
+    std::cerr << "### benchmark_mm\n";
 
     const std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> sizes = {
         // dM, dK, dN
@@ -709,17 +689,11 @@ void benchmark_mm() {
         });
         double gbs = double(dM * dK + dN * dK + dM * dN) * sizeof(bf16) / (s.avg_time * 1e9);
         double flops = 2.0 * double(dM * dN * dK) / (s.avg_time * 1e9);
-        std::cerr << std::left << std::setw(20)
-                  << (std::to_string(dM) + "x" + std::to_string(dK) + "x" + std::to_string(dN))  //
-                  << std::right << std::setw(15) << std::fixed << std::setprecision(3)
-                  << (s.avg_time * 1e3) << " ms"  //
-                  << std::right << std::setw(15) << std::fixed << std::setprecision(1) << gbs
-                  << " GB/s"  //
-                  << std::right << std::setw(15) << std::fixed << std::setprecision(1) << flops
-                  << " GFLOP/s"  //
-                  << std::endl;
+        std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s {:>8.1f} GFLOP/s\n",
+                                 std::format("{} x {} x {}", dM, dK, dN), s.avg_time * 1e3, gbs,
+                                 flops);
     }
-    std::cerr << std::endl;
+    std::cerr << "\n";
 }
 
 }  // namespace benchmarks
@@ -806,7 +780,7 @@ int main() {
     // auto threads = 1;
     auto threads = std::thread::hardware_concurrency();
     omp_set_num_threads(int(threads));
-    std::cerr << "# Using " << threads << " threads" << std::endl << std::endl;
+    std::cerr << std::format("# Using {} threads\n\n", threads);
 
     // demo::demo_vtbl2_u8();
     // demo::demo_lut4_to_bf16();
