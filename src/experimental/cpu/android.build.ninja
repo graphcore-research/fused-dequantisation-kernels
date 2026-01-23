@@ -1,11 +1,13 @@
-cxx = clang++
-flags = -fopenmp -stdlib=libc++
+ndk = /opt/android-sdk/ndk/latest
+cxx = $ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++
+flags = -fopenmp -stdlib=libc++ $
+  --target=aarch64-linux-android35
 cflags = -O3 -DNDEBUG -std=c++20 $
   -Wall -Wextra -Wconversion -Wdouble-promotion -Werror -fdiagnostics-color=always $
-  -mcpu=native
-linkflags =
-libs =
-out = build
+  -DANDROID -mcpu=cortex-x3
+linkflags = -static-libstdc++
+libs = -llog -static-openmp
+out = build/android
 
 rule compile
   command = $cxx $flags $cflags -g -MD -MF $out.d -c -o $out $in
