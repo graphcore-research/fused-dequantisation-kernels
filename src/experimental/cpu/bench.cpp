@@ -120,14 +120,69 @@ float _dot(const bf16* __restrict__ a, const bf16* __restrict__ b, const uint64_
     return result;
 }
 
+// Matrix-vector product between `a` [dK] vector and `b` [BlockN x dK] matrix
+// => `out` [BlockN] vector
+template <uint64_t BlockN, uint64_t BlockK8>
+void _mv_chunk(const bf16* __restrict__ a,
+               const bf16* __restrict__ b,
+               const uint64_t dK,
+               bf16* __restrict__ out) {
+    // Initialize accumulators
+    float32x4_t accs[BlockN * BlockK8];
+#pragma unroll
+    for (auto i = 0u; i < BlockN * BlockK8; ++i) {
+        accs[i] = vmovq_n_f32(0.0f);
+    }
+    // Main loop, process [BlockN, BlockK8 * 8] elements of `b` per iteration
+    constexpr auto StrideK = BlockK8 * 8;
+    const auto kStop = (dK / StrideK) * StrideK;
+    for (auto k0 = 0u; k0 < kStop; k0 += StrideK) {
+#pragma unroll
+        for (auto iK = 0u; iK < BlockK8; ++iK) {
+            auto k = k0 + iK * 8;
+            auto ai = vld1q_bf16(a + k);
+#pragma unroll
+            for (auto n = 0u; n < BlockN; ++n) {
+                auto bi = vld1q_bf16(b + n * dK + k);
+                auto& acc = accs[n * BlockK8 + iK];
+                acc = vbfdotq_f32(acc, ai, bi);
+            }
+        }
+    }
+    // Accumulate partials and store results
+#pragma unroll
+    for (auto n = 0u; n < BlockN; ++n) {
+        // Sum across BlockK8 accumulators
+        auto& acc_n = accs[n * BlockK8];
+#pragma unroll
+        for (auto iK = 1u; iK < BlockK8; ++iK) {
+            acc_n = vaddq_f32(acc_n, accs[n * BlockK8 + iK]);
+        }
+        auto sum = vaddvq_f32(acc_n);
+
+        // Handle remainder when dK is not a multiple of StrideK
+        for (auto k = kStop; k < dK; ++k) {
+            sum += to_float(a[k]) * to_float(b[n * dK + k]);
+        }
+        out[n] = to_bf16(sum);
+    }
+}
+
 NOINLINE void mv(const bf16* __restrict__ a,  // [dK]
                  const bf16* __restrict__ b,  // [dN * dK]
                  const uint64_t dK,
                  const uint64_t dN,
                  bf16* __restrict__ out) {  // [dN]
+    constexpr auto BlockN = 8ull;
+    constexpr auto BlockK8 = 2ull;
+    const auto nStop = BlockN * (dN / BlockN);
 #pragma omp parallel for
-    for (auto n = 0ull; n < dN; ++n) {
-        out[n] = to_bf16(_dot(a, &b[n * dK], dK));
+    for (auto n = 0ull; n < nStop; n += BlockN) {
+        _mv_chunk<BlockN, BlockK8>(a, &b[n * dK], dK, &out[n]);
+    }
+    // Handle remainder when dN is not a multiple of BlockN
+    for (auto n = nStop; n < dN; ++n) {
+        _mv_chunk<1, BlockK8>(a, &b[n * dK], dK, &out[n]);
     }
 }
 
@@ -451,7 +506,8 @@ void expect_close(const std::vector<bf16>& expected,
 void test_kernel_mm() {
     std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> sizes = {
         // dM, dK, dN
-        {1, 100, 200},  //
+        {1, 120, 200},  //
+        {1, 101, 203},  //
         {100, 200, 1},  //
         {32, 16, 64},   //
         {15, 133, 63},  //
