@@ -20,12 +20,12 @@ import seaborn as sns
 PALETTE = sns.color_palette("Dark2")
 SEQ_PALETTE = sns.color_palette("flare", as_cmap=True)
 DISPLAY_NAMES = {
-    "k": "$k$",
+    "k": "$h$",
     "tflops": "TFLOP/s",
     "gb_s": "GB/s",
     "tokens_s": "Tokens/s",
     "impl": "Implementation",
-    "element_bits": "Element Bits",
+    "avg_bits": "$P_w$",
     "parameters": "Parameter Count",
 }
 
