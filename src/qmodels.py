@@ -25,6 +25,7 @@ class QuantisationConfig:
     bits: int
     block_size: int
     kernel: Literal["triton", "torch.compile", "marlin", "marlin-lut"] = "triton"
+    skip: str | None = "^lm_head$"
 
 
 class QuantisedLinear(nn.Module):
@@ -121,6 +122,7 @@ def quantise(
     config: QuantisationConfig,
     device: torch.device,
     dtype: torch.dtype,
+    key: tuple[str, ...] = (),
 ) -> nn.Module:
     """In-place quantisation of all nn.Linear layers in a module.
 
@@ -128,6 +130,11 @@ def quantise(
     """
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
+            if config.skip is not None and re.search(
+                config.skip, ".".join(key + (name,))
+            ):
+                continue  # skip quantising this parameter
+
             assert (
                 type(child) == nn.Linear
             ), f"nn.Linear subclasses are not supported: {type(child)}"
@@ -143,7 +150,7 @@ def quantise(
                 setattr(module, name, QuantisedLinear.create(weight, config))
 
         else:  # recurse
-            quantise(child, config, device=device, dtype=dtype)
+            quantise(child, config, device=device, dtype=dtype, key=key + (name,))
 
     module.to(device=device, dtype=dtype)  # convert non-quantised modules
     return module
@@ -317,7 +324,7 @@ custom_llama_configs = {
         attn_mask_type="block_causal",
         attn_type="flex",
     ),
-    "11B": dict(
+    "12B": dict(
         dim=4096,
         n_layers=48,
         n_heads=32,
@@ -328,7 +335,7 @@ custom_llama_configs = {
         attn_mask_type="block_causal",
         attn_type="flex",
     ),
-    "30B": dict(
+    "31B": dict(
         dim=6144,
         n_layers=60,
         n_heads=48,
@@ -475,7 +482,7 @@ def run_benchmark(settings: BenchmarkSettings, log: qbench.Log) -> None:
 
 
 def _quantisation_configs(
-    bits: list[int], block_sizes: list[int], kernels: list[str]
+    bits: list[int], block_sizes: list[int], kernels: list[str], skip: str
 ) -> Iterable[QuantisationConfig]:
     if 16 in bits:
         yield None  # 16-bit (no quantisation)
@@ -485,7 +492,7 @@ def _quantisation_configs(
                 for kernel in kernels:
                     if not (kernel.startswith("marlin") and b != 4):
                         yield QuantisationConfig(
-                            bits=b, block_size=block_size, kernel=kernel
+                            bits=b, block_size=block_size, kernel=kernel, skip=skip
                         )
 
 
@@ -513,6 +520,11 @@ def _main() -> None:
         type=int,
         nargs="+",
         help="Quantisation bit widths",
+    )
+    parser.add_argument(
+        "--skip",
+        default="^lm_head$",
+        help=f"Regex of parameters to skip during quantisation",
     )
     parser.add_argument(
         "--block-size",
@@ -543,7 +555,7 @@ def _main() -> None:
     with qbench.Log("models") as log:
         for model, batch_size in itertools.product(args.model, args.batch_size):
             for config in _quantisation_configs(
-                args.bits, args.block_size, args.kernel
+                args.bits, args.block_size, args.kernel, args.skip
             ):
                 settings = BenchmarkSettings(
                     model=model,
