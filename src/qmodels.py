@@ -3,7 +3,6 @@
 import copy
 import functools
 import gc
-import itertools
 import re
 import sys
 from dataclasses import dataclass
@@ -118,41 +117,63 @@ def _create_marlin_layer(src: nn.Linear, c: QuantisationConfig) -> nn.Module:
 
 
 def quantise(
-    module: nn.Module,
-    config: QuantisationConfig,
+    source: nn.Module,
+    config: QuantisationConfig | None,
     device: torch.device,
     dtype: torch.dtype,
     key: tuple[str, ...] = (),
 ) -> nn.Module:
-    """In-place quantisation of all nn.Linear layers in a module.
+    """Quantise all nn.Linear layers in a module according to config,
+    returning a new quantised module. The original module is left untouched.
 
     Note: any parameter sharing is lost.
     """
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear):
-            if config.skip is not None and re.search(
-                config.skip, ".".join(key + (name,))
-            ):
-                continue  # skip quantising this parameter
+    should_quantise = (
+        isinstance(source, nn.Linear)
+        and config is not None
+        and (config.skip is None or not re.search(config.skip, ".".join(key)))
+    )
+    if should_quantise:
+        assert (
+            type(source) == nn.Linear
+        ), f"nn.Linear subclasses are not supported: {type(source)}"
+        assert source.bias is None, "Bias is unsupported"
+        assert (
+            source.in_features % 64 == 0
+        ), f"in_features must be multiple of 64, got {source.in_features}"
 
-            assert (
-                type(child) == nn.Linear
-            ), f"nn.Linear subclasses are not supported: {type(child)}"
-            assert child.bias is None, "Bias is unsupported"
-            assert (
-                child.in_features % 64 == 0
-            ), f"in_features must be multiple of 64, got {child.in_features}"
+        if config.kernel.startswith("marlin"):
+            module = _create_marlin_layer(copy.deepcopy(source).to(dtype), config)
+        else:
+            module = QuantisedLinear.create(
+                source.weight.data.to(device, dtype), config
+            )
+    else:
+        # Shallow copy the module object (not its tensors)
+        module = copy.copy(source)
+        module._modules = {}
+        module._parameters = {}
+        module._buffers = {}
+        # Copy parameters and buffers directly owned by this module
+        for name, p in source._parameters.items():
+            module._parameters[name] = (
+                None
+                if p is None
+                else nn.Parameter(
+                    p.to(device=device, dtype=dtype),
+                    requires_grad=p.requires_grad,
+                )
+            )
+        for name, b in source._buffers.items():
+            module._buffers[name] = (
+                None if b is None else b.to(device=device, dtype=dtype)
+            )
 
-            if config.kernel.startswith("marlin"):
-                setattr(module, name, _create_marlin_layer(child.to(dtype), config))
-            else:
-                weight = child.weight.data.to(device, dtype)
-                setattr(module, name, QuantisedLinear.create(weight, config))
-
-        else:  # recurse
-            quantise(child, config, device=device, dtype=dtype, key=key + (name,))
-
-    module.to(device=device, dtype=dtype)  # convert non-quantised modules
+    # Recurse to handle children
+    for name, m in source._modules.items():
+        module._modules[name] = (
+            None if m is None else quantise(m, config, device, dtype, key + (name,))
+        )
     return module
 
 
@@ -169,9 +190,8 @@ def test_quantise() -> None:
             dtype = torch.float16 if kernel.startswith("marlin") else torch.bfloat16
             x = torch.randn((100, 384))
             ref_module = nn.Sequential(nn.Linear(384, 256, bias=False))
-            module = copy.deepcopy(ref_module)
-            quantise(
-                module,
+            module = quantise(
+                ref_module,
                 QuantisationConfig(bits=bits, block_size=64, kernel=kernel),
                 device=device,
                 dtype=dtype,
@@ -428,7 +448,26 @@ def get_custom_llama_tokenizer() -> transformers.PreTrainedTokenizerBase:
     return transformers.AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B")
 
 
-def run_benchmark(settings: BenchmarkSettings, log: qbench.Log) -> None:
+def load_host_model(model_name: str) -> transformers.PreTrainedModel:
+    if model_name.startswith("custom-llama-"):
+        key = model_name.replace("custom-llama-", "")
+        model = transformers.AutoModelForCausalLM.from_config(
+            get_custom_llama_config(key), dtype=torch.float32
+        )
+        model.tokenizer = get_custom_llama_tokenizer()
+    else:
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_name, dtype=torch.float32
+        )
+        model.tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+    return model
+
+
+def run_benchmark(
+    settings: BenchmarkSettings,
+    log: qbench.Log,
+    host_model: transformers.PreTrainedModel,
+) -> None:
     gc.collect()
     torch.cuda.empty_cache()
     torch.compiler.reset()
@@ -452,25 +491,11 @@ def run_benchmark(settings: BenchmarkSettings, log: qbench.Log) -> None:
                 "skipped; model size * bits/param is too large for the device"
             )
 
-        if settings.model.startswith("custom-llama-"):
-            key = settings.model.replace("custom-llama-", "")
-            # Create in float32, since bfloat16 RNG on CPU is slow
-            model = transformers.AutoModelForCausalLM.from_config(
-                get_custom_llama_config(key), dtype=torch.float32
-            )
-            tokenizer = get_custom_llama_tokenizer()
-        else:
-            model = transformers.AutoModelForCausalLM.from_pretrained(
-                settings.model, dtype=dtype
-            )
-            tokenizer = transformers.AutoTokenizer.from_pretrained(model.name_or_path)
-
-        out.update(parameters=sum(p.numel() for p in model.parameters()))
-        if settings.quantisation is not None:
-            quantise(model, settings.quantisation, device=device, dtype=dtype)
-        else:
-            model.to(device=device, dtype=dtype)
-        result = benchmark(model, tokenizer, settings.batch_size, settings.reps)
+        out.update(parameters=sum(p.numel() for p in host_model.parameters()))
+        model = quantise(host_model, settings.quantisation, device=device, dtype=dtype)
+        result = benchmark(
+            model, host_model.tokenizer, settings.batch_size, settings.reps
+        )
         out.update(result.__dict__)
         print(f"{str(settings):>52}:  {result}", file=sys.stderr)
 
@@ -553,17 +578,21 @@ def _main() -> None:
     test_quantise()
 
     with qbench.Log("models") as log:
-        for model, batch_size in itertools.product(args.model, args.batch_size):
-            for config in _quantisation_configs(
-                args.bits, args.block_size, args.kernel, args.skip
-            ):
-                settings = BenchmarkSettings(
-                    model=model,
-                    batch_size=batch_size,
-                    quantisation=config,
-                    reps=args.reps,
-                )
-                run_benchmark(settings, log)
+        for model in args.model:
+            host_model = load_host_model(model)
+            for batch_size in args.batch_size:
+                for config in _quantisation_configs(
+                    args.bits, args.block_size, args.kernel, args.skip
+                ):
+                    settings = BenchmarkSettings(
+                        model=model,
+                        batch_size=batch_size,
+                        quantisation=config,
+                        reps=args.reps,
+                    )
+                    run_benchmark(settings, log, host_model)
+            del host_model
+            gc.collect()
 
 
 if __name__ == "__main__":
