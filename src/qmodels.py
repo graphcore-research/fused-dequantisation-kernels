@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Graphcore Ltd. All rights reserved.
+
 """Model-level quantisation and benchmarking."""
 
 import copy

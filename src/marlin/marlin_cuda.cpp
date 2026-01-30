@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// With modifications described in README.md
+// Copyright (c) 2026 Graphcore Ltd. All rights reserved.
 
 
 #include <torch/all.h>

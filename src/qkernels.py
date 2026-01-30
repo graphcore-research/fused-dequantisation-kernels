@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Graphcore Ltd. All rights reserved.
+
 import torch
 import triton
 import triton.language as tl

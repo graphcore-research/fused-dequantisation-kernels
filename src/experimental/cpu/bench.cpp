@@ -1,4 +1,4 @@
-// Arm CPU kernels and benchmarks
+// Copyright (c) 2026 Graphcore Ltd. All rights reserved.
 
 #if !defined(__ARM_NEON)
 #error "This benchmark requires ARM NEON support."
