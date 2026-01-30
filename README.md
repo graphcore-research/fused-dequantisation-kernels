@@ -1,4 +1,8 @@
-# Quantisation benchmarking
+# Fused Dequantisation Kernels
+
+This repository contains fused dequantisation kernels for various weight quantisation formats, along with benchmarking scripts to evaluate their performance on different models and batch sizes.
+
+Commands to run benchmarks, first of kernels, then models:
 
 ```sh
 python src/qbench.py
@@ -22,9 +26,6 @@ echo 'export PYTHONPATH=$(dirname ${VIRTUAL_ENV})/src' >> .venv/bin/activate
 ```sh
 ninja -C src/experimental/cpu build/bench
 ./src/experimental/cpu/build/bench
-
-ninja -C src/experimental/cuda build/bench build/bench.ptx
-./src/experimental/cuda/build/bench
 ```
 
 ## Profiling
@@ -39,3 +40,9 @@ sudo $(which ncu) --kernel-name="regex:.*kernel__mv.*" --launch-skip=100 --launc
 ## Credits
 
 Includes code from [IST-DASLab/marlin](https://github.com/IST-DASLab/marlin), see [src/marlin/README.md](src/marlin/README.md) for details.
+
+## License
+
+Copyright (c) 2026 Graphcore Ltd. Licensed under the MIT License.
+
+See LICENSE for further details.

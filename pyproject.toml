@@ -1,14 +1,15 @@
 [project]
-name = "quantisation-benchmarking"
+name = "fused-dequantisation-kernels"
 version = "0.1.0"
-description = "Dequantisation kernel benchmarks"
+description = "Dequantisation kernels and benchmarks for weight quantisation formats"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "setuptools", # for torch.utils.cpp_extension
     "tqdm",
     "torch",
     "triton",
-    "transformers==4.57.5",
+    "transformers",
 ]
 
 [project.optional-dependencies]
