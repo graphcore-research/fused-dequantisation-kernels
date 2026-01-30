@@ -5,4 +5,4 @@ Adapted from [IST-DASLab/marlin](https://github.com/IST-DASLab/marlin) by Elias 
 Changes by Graphcore Ltd., licensed under the MIT License.:
 
  - Add support for a lookup table via `centroids`
- - Support from group size 64
+ - Support for group size 64
