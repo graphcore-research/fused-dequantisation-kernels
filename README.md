@@ -41,6 +41,8 @@ sudo $(which ncu) --kernel-name="regex:.*kernel__mv.*" --launch-skip=100 --launc
 
 Includes code from [IST-DASLab/marlin](https://github.com/IST-DASLab/marlin), see [src/marlin/README.md](src/marlin/README.md) for details.
 
+Our work was based on an Marlin port to add LUT support, written by [Sohir Maskey](https://github.com/SohirMaskey).
+
 ## License
 
 Copyright (c) 2026 Graphcore Ltd. Licensed under the MIT License.
