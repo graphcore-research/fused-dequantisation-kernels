@@ -21,11 +21,26 @@ uv sync --extra dev
 echo 'export PYTHONPATH=$(dirname ${VIRTUAL_ENV})/src' >> .venv/bin/activate
 ```
 
-## Experimental code
+## Experimental
+
+These benchmarks are not included the main benchmarks above and in our paper results, but are included here for reference.
+
+**CPU (ARM Host)**
+
+Requires `clang++` with {`openmp`, `libc++`}, and `ninja` on your PATH.
 
 ```sh
 ninja -C src/experimental/cpu build/bench
 ./src/experimental/cpu/build/bench
+```
+
+**CPU (Android)**
+
+Requires NDK at `/opt/android-sdk/ndk/latest` and `adb` on your PATH.
+
+```sh
+cd src/experimental/cpu
+./run_on_device.sh
 ```
 
 ## Profiling
@@ -35,6 +50,13 @@ Requires `ncu`, [NVIDIA Nsight Compute](https://developer.nvidia.com/tools-overv
 ```sh
 mkdir -p out/profiles
 sudo $(which ncu) --kernel-name="regex:.*kernel__mv.*" --launch-skip=100 --launch-count=10 -o out/profiles/mv_lut8_4b $(which python) src/qbench.py --profile mv_lut8 -b 4
+```
+
+For experimental CPU kernels, we suggest inspecting the disassembly:
+
+```sh
+ninja -C src/experimental/cpu build/bench.s
+# see src/experimental/cpu/build/bench.s
 ```
 
 ## Credits
