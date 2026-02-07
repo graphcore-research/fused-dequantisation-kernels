@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <arm_neon.h>
+#include <arm_sve.h>
 #include <omp.h>
 
 #define NOINLINE __attribute__((noinline))
@@ -120,31 +121,34 @@ float _dot(const bf16* __restrict__ a, const bf16* __restrict__ b, const uint64_
     return result;
 }
 
+// ----------------------------------------------------------------------------
+// mv
+
 // Matrix-vector product between `a` [dK] vector and `b` [BlockN x dK] matrix
 // => `out` [BlockN] vector
-template <uint64_t BlockN, uint64_t BlockK8>
+template <uint64_t BlockN, uint64_t BlockK>
 void _mv_chunk(const bf16* __restrict__ a,
                const bf16* __restrict__ b,
                const uint64_t dK,
                bf16* __restrict__ out) {
     // Initialize accumulators
-    float32x4_t accs[BlockN * BlockK8];
+    float32x4_t accs[BlockN * BlockK];
 #pragma unroll
-    for (auto i = 0u; i < BlockN * BlockK8; ++i) {
+    for (auto i = 0u; i < BlockN * BlockK; ++i) {
         accs[i] = vmovq_n_f32(0.0f);
     }
-    // Main loop, process [BlockN, BlockK8 * 8] elements of `b` per iteration
-    constexpr auto StrideK = BlockK8 * 8;
+    // Main loop, process [BlockN, BlockK * 8] elements of `b` per iteration
+    constexpr auto StrideK = BlockK * 8;
     const auto kStop = (dK / StrideK) * StrideK;
     for (auto k0 = 0u; k0 < kStop; k0 += StrideK) {
 #pragma unroll
-        for (auto iK = 0u; iK < BlockK8; ++iK) {
+        for (auto iK = 0u; iK < BlockK; ++iK) {
             auto k = k0 + iK * 8;
             auto ai = vld1q_bf16(&a[k]);
 #pragma unroll
             for (auto n = 0u; n < BlockN; ++n) {
                 auto bi = vld1q_bf16(&b[n * dK + k]);
-                auto& acc = accs[n * BlockK8 + iK];
+                auto& acc = accs[n * BlockK + iK];
                 acc = vbfdotq_f32(acc, ai, bi);
             }
         }
@@ -152,11 +156,11 @@ void _mv_chunk(const bf16* __restrict__ a,
     // Accumulate partials and store results
 #pragma unroll
     for (auto n = 0u; n < BlockN; ++n) {
-        // Sum across BlockK8 accumulators
-        auto& acc_n = accs[n * BlockK8];
+        // Sum across BlockK accumulators
+        auto& acc_n = accs[n * BlockK];
 #pragma unroll
-        for (auto iK = 1u; iK < BlockK8; ++iK) {
-            acc_n = vaddq_f32(acc_n, accs[n * BlockK8 + iK]);
+        for (auto iK = 1u; iK < BlockK; ++iK) {
+            acc_n = vaddq_f32(acc_n, accs[n * BlockK + iK]);
         }
         auto sum = vaddvq_f32(acc_n);
 
@@ -168,23 +172,75 @@ void _mv_chunk(const bf16* __restrict__ a,
     }
 }
 
+template <uint64_t N>
+void _mv_chunk_sve(const bf16* __restrict__ a,
+                   const bf16* __restrict__ b,
+                   const uint64_t dK,
+                   bf16* __restrict__ out) {
+    static_assert(N <= 8);
+    svfloat32_t acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7;
+    if constexpr (N >= 1) acc0 = svdup_f32(0.0f);
+    if constexpr (N >= 2) acc1 = svdup_f32(0.0f);
+    if constexpr (N >= 3) acc2 = svdup_f32(0.0f);
+    if constexpr (N >= 4) acc3 = svdup_f32(0.0f);
+    if constexpr (N >= 5) acc4 = svdup_f32(0.0f);
+    if constexpr (N >= 6) acc5 = svdup_f32(0.0f);
+    if constexpr (N >= 7) acc6 = svdup_f32(0.0f);
+    if constexpr (N >= 8) acc7 = svdup_f32(0.0f);
+    const uint64_t VL = svcntb() / sizeof(bf16);
+    for (auto k = 0ull; k < dK; k += VL) {
+        svbool_t p = svwhilelt_b16(k, dK);
+        svbfloat16_t ak = svld1_bf16(p, &a[k]);
+        if constexpr (N >= 1) acc0 = svbfdot(acc0, ak, svld1_bf16(p, &b[0 * dK + k]));
+        if constexpr (N >= 2) acc1 = svbfdot(acc1, ak, svld1_bf16(p, &b[1 * dK + k]));
+        if constexpr (N >= 3) acc2 = svbfdot(acc2, ak, svld1_bf16(p, &b[2 * dK + k]));
+        if constexpr (N >= 4) acc3 = svbfdot(acc3, ak, svld1_bf16(p, &b[3 * dK + k]));
+        if constexpr (N >= 5) acc4 = svbfdot(acc4, ak, svld1_bf16(p, &b[4 * dK + k]));
+        if constexpr (N >= 6) acc5 = svbfdot(acc5, ak, svld1_bf16(p, &b[5 * dK + k]));
+        if constexpr (N >= 7) acc6 = svbfdot(acc6, ak, svld1_bf16(p, &b[6 * dK + k]));
+        if constexpr (N >= 8) acc7 = svbfdot(acc7, ak, svld1_bf16(p, &b[7 * dK + k]));
+    }
+    if constexpr (N >= 1) out[0] = to_bf16(svaddv_f32(svptrue_b32(), acc0));
+    if constexpr (N >= 2) out[1] = to_bf16(svaddv_f32(svptrue_b32(), acc1));
+    if constexpr (N >= 3) out[2] = to_bf16(svaddv_f32(svptrue_b32(), acc2));
+    if constexpr (N >= 4) out[3] = to_bf16(svaddv_f32(svptrue_b32(), acc3));
+    if constexpr (N >= 5) out[4] = to_bf16(svaddv_f32(svptrue_b32(), acc4));
+    if constexpr (N >= 6) out[5] = to_bf16(svaddv_f32(svptrue_b32(), acc5));
+    if constexpr (N >= 7) out[6] = to_bf16(svaddv_f32(svptrue_b32(), acc6));
+    if constexpr (N >= 8) out[7] = to_bf16(svaddv_f32(svptrue_b32(), acc7));
+}
+
+template <bool UseSVE = true, uint64_t BlockN = 8ull, uint64_t BlockK = 2ull>
 NOINLINE void mv(const bf16* __restrict__ a,  // [dK]
                  const bf16* __restrict__ b,  // [dN * dK]
                  const uint64_t dK,
                  const uint64_t dN,
                  bf16* __restrict__ out) {  // [dN]
-    constexpr auto BlockN = 8ull;
-    constexpr auto BlockK8 = 2ull;
-    const auto nStop = BlockN * (dN / BlockN);
+    if (UseSVE) {
+        const auto nStop = BlockN * (dN / BlockN);
 #pragma omp parallel for
-    for (auto n = 0ull; n < nStop; n += BlockN) {
-        _mv_chunk<BlockN, BlockK8>(a, &b[n * dK], dK, &out[n]);
-    }
-    // Handle remainder when dN is not a multiple of BlockN
-    for (auto n = nStop; n < dN; ++n) {
-        _mv_chunk<1, BlockK8>(a, &b[n * dK], dK, &out[n]);
+        for (auto n = 0ull; n < nStop; n += BlockN) {
+            _mv_chunk_sve<BlockN>(a, &b[n * dK], dK, &out[n]);
+        }
+        // Handle remainder when dN is not a multiple of BlockN
+        for (auto n = nStop; n < dN; ++n) {
+            _mv_chunk_sve<1>(a, &b[n * dK], dK, &out[n]);
+        }
+    } else {
+        const auto nStop = BlockN * (dN / BlockN);
+#pragma omp parallel for
+        for (auto n = 0ull; n < nStop; n += BlockN) {
+            _mv_chunk<BlockN, BlockK>(a, &b[n * dK], dK, &out[n]);
+        }
+        // Handle remainder when dN is not a multiple of BlockN
+        for (auto n = nStop; n < dN; ++n) {
+            _mv_chunk<1, BlockK>(a, &b[n * dK], dK, &out[n]);
+        }
     }
 }
+
+// ----------------------------------------------------------------------------
+// mm
 
 template <uint BlockM, uint BlockN>
 void _mm_chunk_bfmmla(const bf16* __restrict__ a,
@@ -318,7 +374,8 @@ void mm_naive(const bf16* __restrict__ a,  // [dM * dK]
     }
 }
 
-// LUT8
+// -----------------------------------------------------------------------------
+// mv_lut8
 
 float _dot_lut8(const bf16* __restrict__ a,
                 const uint32_t* __restrict__ b,
@@ -364,11 +421,12 @@ NOINLINE void mv_lut8(const bf16* __restrict__ a,         // [dK]
     }
 }
 
-// LUT
+// -----------------------------------------------------------------------------
+// mv_lut
 
 // Matrix-vector product between `a` [dK] and `b` [BlockN x dK], which is 4-bit quantized,
 // scaled by `bs` [BlockN x (dK/dG)] => `out` [BlockN]
-template <uint64_t dG, uint64_t BlockN, uint64_t BlockK16>
+template <uint64_t dG, uint64_t BlockN, uint64_t BlockK>
 void _mv_lut_chunk(const bf16* __restrict__ a,
                    const uint8_t* __restrict__ b,
                    const uint8x16_t lut_lo,
@@ -376,7 +434,7 @@ void _mv_lut_chunk(const bf16* __restrict__ a,
                    const bf16* __restrict__ bs,
                    const uint64_t dK,
                    bf16* __restrict__ out) {
-    static_assert(dG % (BlockK16 * 16) == 0, "dG must be multiple of BlockK16 * 16");
+    static_assert(dG % (BlockK * 32) == 0, "dG must be multiple of BlockK * 32");
 
     // Accumulators: BlockN rows x BlockK16 partial sums (unscaled within group)
     // Plus BlockN scaled accumulators for final results
@@ -389,42 +447,53 @@ void _mv_lut_chunk(const bf16* __restrict__ a,
     // Main loop over groups
     for (auto g = 0u; g < (dK / dG); ++g) {
         // Initialise unscaled accumulators
-        float32x4_t accs[BlockN * BlockK16];
+        float32x4_t accs[BlockN * BlockK];
 #pragma unroll
-        for (auto i = 0u; i < BlockN * BlockK16; ++i) {
+        for (auto i = 0u; i < BlockN * BlockK; ++i) {
             accs[i] = vmovq_n_f32(0.0f);
         }
         // Accumulate over the group
 #pragma unroll
-        for (auto iK = 0u; iK < dG / 16; ++iK) {
-            auto k = g * dG + iK * 16;
-            auto ai0 = vld1q_bf16(&a[k]);
-            auto ai1 = vld1q_bf16(&a[k + 8]);
+        for (auto iK = 0u; iK < dG / 32; ++iK) {
+            auto k = g * dG + iK * 32;
+            bfloat16x8_t ai0 = vld1q_bf16(&a[k]);
+            bfloat16x8_t ai1 = vld1q_bf16(&a[k + 8]);
+            bfloat16x8_t ai2 = vld1q_bf16(&a[k + 16]);
+            bfloat16x8_t ai3 = vld1q_bf16(&a[k + 24]);
 #pragma unroll
             for (auto n = 0u; n < BlockN; ++n) {
-                uint8x8_t biq = vld1_u8(&b[n * (dK / 2) + k / 2]);
-                uint8x8_t idx_lo = vand_u8(biq, vdup_n_u8(0x0F));
-                uint8x8_t idx_hi = vshr_n_u8(biq, 4);
-                uint8x16_t idx = vcombine_u8(idx_lo, idx_hi);
-                uint8x16_t t_lo = vqtbl1q_u8(lut_lo, idx);
-                uint8x16_t t_hi = vqtbl1q_u8(lut_hi, idx);
-                bfloat16x8_t biu0 = vreinterpretq_bf16_u8(vzip1q_u8(t_lo, t_hi));
-                bfloat16x8_t biu1 = vreinterpretq_bf16_u8(vzip2q_u8(t_lo, t_hi));
+                uint8x16_t biq = vld1q_u8(&b[n * (dK / 2) + k / 2]);
+                uint8x16_t idx0 = vandq_u8(biq, vdupq_n_u8(0x0F));
+                uint8x16_t idx1 = vshrq_n_u8(biq, 4);
 
-                auto& acc = accs[n * BlockK16 + (iK % BlockK16)];
+                // Decode idx0
+                uint8x16_t t0_lo = vqtbl1q_u8(lut_lo, idx0);
+                uint8x16_t t0_hi = vqtbl1q_u8(lut_hi, idx0);
+                bfloat16x8_t biu0 = vreinterpretq_bf16_u8(vzip1q_u8(t0_lo, t0_hi));
+                bfloat16x8_t biu1 = vreinterpretq_bf16_u8(vzip2q_u8(t0_lo, t0_hi));
+
+                // Decode idx1
+                uint8x16_t t1_lo = vqtbl1q_u8(lut_lo, idx1);
+                uint8x16_t t1_hi = vqtbl1q_u8(lut_hi, idx1);
+                bfloat16x8_t biu2 = vreinterpretq_bf16_u8(vzip1q_u8(t1_lo, t1_hi));
+                bfloat16x8_t biu3 = vreinterpretq_bf16_u8(vzip2q_u8(t1_lo, t1_hi));
+
+                float32x4_t& acc = accs[n * BlockK + (iK % BlockK)];
                 acc = vbfdotq_f32(acc, ai0, biu0);
                 acc = vbfdotq_f32(acc, ai1, biu1);
+                acc = vbfdotq_f32(acc, ai2, biu2);
+                acc = vbfdotq_f32(acc, ai3, biu3);
             }
         }
 
-        // Sum across BlockK16 accumulators and apply scale
+        // Sum across BlockK accumulators and apply scale
 #pragma unroll
         for (auto n = 0u; n < BlockN; ++n) {
-            auto& acc_n = accs[n * BlockK16];
+            auto& acc_n = accs[n * BlockK];
 #pragma unroll
-            for (auto iK = 1u; iK < BlockK16; ++iK) {
-                acc_n = vaddq_f32(acc_n, accs[n * BlockK16 + iK]);
-                accs[n * BlockK16 + iK] = vmovq_n_f32(0.0f);
+            for (auto iK = 1u; iK < BlockK; ++iK) {
+                acc_n = vaddq_f32(acc_n, accs[n * BlockK + iK]);
+                accs[n * BlockK + iK] = vmovq_n_f32(0.0f);
             }
             auto scale = vcvt_f32_bf16(vld1_dup_bf16(&bs[n * (dK / dG) + g]));
             acc_scaled[n] = vmlaq_f32(acc_scaled[n], acc_n, scale);
@@ -438,7 +507,7 @@ void _mv_lut_chunk(const bf16* __restrict__ a,
     }
 }
 
-template <uint64_t dG, uint64_t BlockN = 8, uint64_t BlockK16 = 1>
+template <uint64_t dG, uint64_t BlockN = 8, uint64_t BlockK = 1>
 NOINLINE void mv_lut(const bf16* __restrict__ a,     // [dK]
                      const uint8_t* __restrict__ b,  // [dN * (dK/2)]
                      const bf16* __restrict__ lut,   // [16]
@@ -447,7 +516,7 @@ NOINLINE void mv_lut(const bf16* __restrict__ a,     // [dK]
                      const uint64_t dN,
                      bf16* __restrict__ out) {  // [dN]
     assert(dK % dG == 0);
-    assert(dG % 16 == 0);
+    assert(dG % 32 == 0);
 
     // Load LUT into tables of low-bytes and high-bytes
     uint16x8_t lut0 = vreinterpretq_u16_bf16(vld1q_bf16(&lut[0]));
@@ -458,13 +527,104 @@ NOINLINE void mv_lut(const bf16* __restrict__ a,     // [dK]
     const auto nStop = BlockN * (dN / BlockN);
 #pragma omp parallel for
     for (auto n = 0ull; n < nStop; n += BlockN) {
-        _mv_lut_chunk<dG, BlockN, BlockK16>(a, &b[n * (dK / 2)], lut_lo, lut_hi, &bs[n * (dK / dG)],
-                                            dK, &out[n]);
+        _mv_lut_chunk<dG, BlockN, BlockK>(a, &b[n * (dK / 2)], lut_lo, lut_hi, &bs[n * (dK / dG)],
+                                          dK, &out[n]);
     }
     // Handle remainder when dN is not a multiple of BlockN
     for (auto n = nStop; n < dN; ++n) {
-        _mv_lut_chunk<dG, 1, BlockK16>(a, &b[n * (dK / 2)], lut_lo, lut_hi, &bs[n * (dK / dG)], dK,
-                                       &out[n]);
+        _mv_lut_chunk<dG, 1, BlockK>(a, &b[n * (dK / 2)], lut_lo, lut_hi, &bs[n * (dK / dG)], dK,
+                                     &out[n]);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// mv_lut_sve
+
+// Load and broadcast a single bf16 into all f32 lanes
+static inline svfloat32_t load_dup_bf16_as_f32(const bf16* p) {
+    // Load bf16 bits and broadcast. Written this way so the compiler can fold to LD1RH.
+    svuint16_t v16 = svdup_n_u16(*reinterpret_cast<const uint16_t*>(p));
+    // Widen u16 -> u32 (low half) and shift to convert to f32
+    return svreinterpret_f32_u32(svlsl_n_u32_x(svptrue_b32(), svunpklo_u32(v16), 16));
+}
+
+template <uint64_t dG>
+void _mv_lut_chunk_sve_N1(const bf16* __restrict__ a,
+                          const uint8_t* __restrict__ b,
+                          const svuint8_t lut_lo,
+                          const svuint8_t lut_hi,
+                          const bf16* __restrict__ bs,
+                          const uint64_t dK,
+                          bf16* __restrict__ out) {
+    const uint64_t VLb = svcntb();   // bytes / vector
+    const uint64_t VLh = VLb / 2;    // bf16 lanes / vector
+    const uint64_t KStep = 2 * VLb;  // elements per iter
+
+    svfloat32_t acc_scaled0 = svdup_f32(0.0f);
+    const uint64_t nG = dK / dG;
+    for (uint64_t g = 0; g < nG; ++g) {
+        svfloat32_t acc0 = svdup_f32(0.0f);
+        for (auto iK = 0ull; iK < dG / KStep; ++iK) {
+            auto k = g * dG + iK * KStep;
+            const svbfloat16_t a0 = svld1_bf16(svptrue_b16(), &a[k + 0 * VLh]);
+            const svbfloat16_t a1 = svld1_bf16(svptrue_b16(), &a[k + 1 * VLh]);
+            const svbfloat16_t a2 = svld1_bf16(svptrue_b16(), &a[k + 2 * VLh]);
+            const svbfloat16_t a3 = svld1_bf16(svptrue_b16(), &a[k + 3 * VLh]);
+
+            // Load packed 4-bit indices
+            const svuint8_t biq = svld1_u8(svptrue_b8(), &b[k / 2]);
+            const svuint8_t idx0 = svand_n_u8_z(svptrue_b8(), biq, 0x0F);  // k .. k+VLb-1
+            const svuint8_t idx1 = svlsr_n_u8_z(svptrue_b8(), biq, 4);     // k+VLb .. k+2*VLb-1
+
+            // Decode idx0
+            const svuint8_t t0_lo = svtbl_u8(lut_lo, idx0);
+            const svuint8_t t0_hi = svtbl_u8(lut_hi, idx0);
+            const svbfloat16_t b0 =
+                svreinterpret_bf16_u16(svreinterpret_u16_u8(svzip1_u8(t0_lo, t0_hi)));
+            const svbfloat16_t b1 =
+                svreinterpret_bf16_u16(svreinterpret_u16_u8(svzip2_u8(t0_lo, t0_hi)));
+
+            // Decode idx1
+            const svuint8_t t1_lo = svtbl_u8(lut_lo, idx1);
+            const svuint8_t t1_hi = svtbl_u8(lut_hi, idx1);
+            const svbfloat16_t b2 =
+                svreinterpret_bf16_u16(svreinterpret_u16_u8(svzip1_u8(t1_lo, t1_hi)));
+            const svbfloat16_t b3 =
+                svreinterpret_bf16_u16(svreinterpret_u16_u8(svzip2_u8(t1_lo, t1_hi)));
+
+            // Accumulate
+            acc0 = svbfdot(acc0, a0, b0);
+            acc0 = svbfdot(acc0, a1, b1);
+            acc0 = svbfdot(acc0, a2, b2);
+            acc0 = svbfdot(acc0, a3, b3);
+        }
+        svfloat32_t scale = load_dup_bf16_as_f32(&bs[g]);
+        acc_scaled0 = svmla_f32_x(svptrue_b32(), acc_scaled0, acc0, scale);
+    }
+    out[0] = to_bf16(svaddv_f32(svptrue_b32(), acc_scaled0));
+}
+
+template <uint64_t dG>
+NOINLINE void mv_lut_sve(const bf16* __restrict__ a,
+                         const uint8_t* __restrict__ b,
+                         const bf16* __restrict__ lut,
+                         const bf16* __restrict__ bs,
+                         const uint64_t dK,
+                         const uint64_t dN,
+                         bf16* __restrict__ out) {
+    assert((dG % (2 * svcntb()) == 0) && "dG must be multiple of (SVE vector length / 4 bits)");
+
+    uint16x8_t lut0 = vreinterpretq_u16_bf16(vld1q_bf16(&lut[0]));
+    uint16x8_t lut1 = vreinterpretq_u16_bf16(vld1q_bf16(&lut[8]));
+    uint8x16_t lut_lo_neon = vcombine_u8(vmovn_u16(lut0), vmovn_u16(lut1));
+    uint8x16_t lut_hi_neon = vcombine_u8(vshrn_n_u16(lut0, 8), vshrn_n_u16(lut1, 8));
+    svuint8_t lut_lo = svld1rq_u8(svptrue_b8(), reinterpret_cast<const uint8_t*>(&lut_lo_neon));
+    svuint8_t lut_hi = svld1rq_u8(svptrue_b8(), reinterpret_cast<const uint8_t*>(&lut_hi_neon));
+
+#pragma omp parallel for
+    for (uint64_t n = 0; n < dN; ++n) {
+        _mv_lut_chunk_sve_N1<dG>(a, b + n * (dK / 2), lut_lo, lut_hi, bs + n * (dK / dG), dK,
+                                 out + n);
     }
 }
 
@@ -567,9 +727,13 @@ void test_kernel_mm() {
 
         if (dM == 1) {
             // Also test the MV kernel
-            std::vector<bf16> out_mv(dN);
-            kernels::mv(a.data(), b.data(), dK, dN, out_mv.data());
-            EXPECT_EQ(expected, out_mv, 1e-3f);
+            std::vector<bf16> out_mv_neon(dN);
+            kernels::mv</*UseSVE=*/false>(a.data(), b.data(), dK, dN, out_mv_neon.data());
+            EXPECT_EQ(expected, out_mv_neon, 1e-3f);
+
+            std::vector<bf16> out_mv_sve(dN);
+            kernels::mv</*UseSVE=*/true>(a.data(), b.data(), dK, dN, out_mv_sve.data());
+            EXPECT_EQ(expected, out_mv_sve, 1e-3f);
         }
     }
 }
@@ -674,26 +838,28 @@ struct ScaledTensor {
         return output;
     }
 
-    // When using the LUT4 kernel, it's more efficient to process all of the low nibbles
-    // together (contiguous across k), then all of the high nibbles together.
+    // It's more efficient to process all of the low nibbles together (contiguous
+    // across k), then all of the high nibbles together.
     //
+    // E.g. block_size=16:
     // Input:  [0,1], [2,3], [4,5],  [6,7],  [8,9],  [10,11], [12,13], [14,15]
     // Output: [0,8], [1,9], [2,10], [3,11], [4,12], [5,13],  [6,14],  [7,15]
-    std::vector<uint8_t> permute_for_lut4() const {
+    std::vector<uint8_t> permute_for_block_nibbles(uint64_t block_size) const {
         assert(bits_per_element == 4);
+        assert(block_size % 2 == 0);
         std::vector<uint8_t> permuted(data.size());
 
-        // Process each 16-element block (8 bytes)
-        for (auto g = 0ull; g < data.size(); g += 8) {
+        // Process each block
+        std::vector<uint8_t> nibbles(block_size);
+        for (auto g = 0ull; g < data.size(); g += (block_size / 2)) {
             // Extract nibbles
-            uint8_t elems[16];
-            for (auto i = 0u; i < 8; ++i) {
-                elems[2 * i] = data[g + i] & 0x0F;             // low nibbles
-                elems[2 * i + 1] = (data[g + i] >> 4) & 0x0F;  // high nibbles
+            for (auto i = 0u; i < (block_size / 2); ++i) {
+                nibbles[2 * i] = data[g + i] & 0x0F;             // low nibbles
+                nibbles[2 * i + 1] = (data[g + i] >> 4) & 0x0F;  // high nibbles
             }
             // Reorder and repack
-            for (auto i = 0u; i < 8; ++i) {
-                permuted[g + i] = elems[i] | uint8_t(elems[i + 8] << 4);
+            for (auto i = 0u; i < (block_size / 2); ++i) {
+                permuted[g + i] = nibbles[i] | uint8_t(nibbles[i + (block_size / 2)] << 4);
             }
         }
         return permuted;
@@ -702,8 +868,7 @@ struct ScaledTensor {
 
 void test_block_quantise() {
     uint64_t dK = 64, dN = 8, bits_per_element = 4;
-    // uint64_t dK = 32, dN = 1, bits_per_element = 4;
-    constexpr uint64_t dG = 16;
+    constexpr uint64_t dG = 32;
 
     std::default_random_engine rng(200);
     auto a = randn(dK, rng);
@@ -725,14 +890,19 @@ void test_block_quantise() {
                      actual.data());
 
     std::vector<bf16> actual4(dN);
-    auto bq_data_perm = bq.permute_for_lut4();
-    kernels::mv_lut<dG, 4, 1>(a.data(), bq_data_perm.data(), bq.lut.data(), bq.scale.data(), dK, dN,
+    auto bq_lut_data = bq.permute_for_block_nibbles(32);
+    kernels::mv_lut<dG, 4, 1>(a.data(), bq_lut_data.data(), bq.lut.data(), bq.scale.data(), dK, dN,
                               actual4.data());
 
-    EXPECT_CLOSE(ref, actual, 0.001);
+    std::vector<bf16> actual_sve(dN);
+    auto bq_sve_data = bq.permute_for_block_nibbles(svcntb() * 2);
+    kernels::mv_lut_sve<dG>(a.data(), bq_sve_data.data(), bq.lut.data(), bq.scale.data(), dK, dN,
+                            actual_sve.data());
+
     EXPECT_CLOSE(original, actual, 0.2);  // depends on bits_per_element
+    EXPECT_CLOSE(ref, actual, 0.001);
     EXPECT_CLOSE(ref, actual4, 0.001);
-    EXPECT_CLOSE(original, actual4, 0.2);  // depends on bits_per_element
+    EXPECT_CLOSE(ref, actual_sve, 0.001);
 }
 
 void test_all() {
@@ -935,6 +1105,43 @@ void benchmark_mv_lut() {
     std::cerr << "\n";
 }
 
+void benchmark_mv_lut_sve() {
+    std::cerr << "### benchmark_mv_lut_sve\n";
+
+    const std::vector<std::tuple<uint64_t, uint64_t>> sizes = {
+        {4096, 4096},
+        {8192, 8192},
+    };
+    const uint64_t reps = 16;
+    constexpr uint64_t dG = 64;
+
+    for (const auto& size : sizes) {
+        auto dK = std::get<0>(size), dN = std::get<1>(size);
+
+        // Allocate
+        auto copies = (1ull << 30) / (dK * dN * sizeof(bf16));
+        std::vector<bf16> a(copies * dK, bf16(0.5f));
+        std::vector<uint32_t> b32(copies * dN * (dK / 8), 0xfedc0123);
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(b32.data());
+        std::vector<bf16> bs(copies * dN * (dK / dG), bf16(0.25f));
+        std::vector<bf16> out(copies * dN);
+        std::vector<bf16> lut(16, bf16(10.0f));
+
+        // Benchmark
+        auto s = measure_time(reps, [&](uint64_t i) {
+            auto idx = i % copies;
+            kernels::mv_lut_sve<dG>(&a[idx * dK], &b[idx * dN * (dK / 2)], &lut[0],
+                                    &bs[idx * dN * (dK / dG)], dK, dN, &out[idx * dN]);
+        });
+        double bytes = double(dK * sizeof(bf16) + dN * (dK / 2) * sizeof(uint8_t) +
+                              dN * (dK / dG) * sizeof(bf16) + dN * sizeof(bf16));
+        double gbs = bytes / (s.avg_time * 1e9);
+        std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n",
+                                 std::format("{} x {}", dK, dN), s.avg_time * 1e3, gbs);
+    }
+    std::cerr << "\n";
+}
+
 void benchmark_mm() {
     std::cerr << "### benchmark_mm\n";
 
@@ -980,7 +1187,9 @@ int main() {
 
     omp_set_num_threads(int(threads));
     omp_set_schedule(omp_sched_static, 0);
-    std::cerr << std::format("# Using {} threads\n\n", threads);
+    std::cerr << std::format("# Using {} threads\n", threads);
+    std::cerr << std::format("# SVE vector length: {} bits\n", 8 * svcntb());
+    std::cerr << "\n";
 
     tests::test_all();
 
@@ -989,6 +1198,7 @@ int main() {
     benchmarks::benchmark_mv();
     benchmarks::benchmark_mv_lut8();
     benchmarks::benchmark_mv_lut();
+    benchmarks::benchmark_mv_lut_sve();
     benchmarks::benchmark_mm();
 
     return 0;
