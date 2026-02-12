@@ -5,7 +5,7 @@ This repository contains fused dequantisation kernels for various weight quantis
 Use the kernels:
 
 ```sh
-pip install git+ssh://github.com/graphcore-research/fused-dequantisation-kernels
+pip install git+ssh://git@github.com/graphcore-research/fused-dequantisation-kernels
 ```
 
 ```py3
@@ -37,7 +37,7 @@ python -m fdk.bench --exclude '' -b 16 8 4 2 1 -k 8192 6144 4096 3072
 python -m fdk.models --model custom-llama-4B custom-llama-12B custom-llama-31B --batch-size 1 4 16 64 256 --kernel triton marlin-lut marlin torch.compile
 ```
 
-Development/experimentation setup:
+## Dev setup
 
 ```sh
 sudo apt install ninja-build pybind11-dev
