@@ -14,9 +14,7 @@ import torch
 import transformers
 from torch import Tensor, nn
 
-import marlin
-import qbench
-import qkernels
+from . import bench, kernels, marlin
 
 # Quantised models
 
@@ -51,21 +49,33 @@ class QuantisedLinear(nn.Module):
         if x.ndim > 2:
             return self.forward(x.flatten(end_dim=-2)).unflatten(0, x.shape[:-1])
         if self.kernel == "torch.compile":
-            return qkernels.mm_lut_ref(x, self.weight_data, self.lut, self.scale)
+            return kernels.mm_lut_ref(x, self.weight_data, self.lut, self.scale)
         assert self.kernel == "triton"
         out = torch.empty(
             (x.shape[0], self.weight_data.shape[0]), device=x.device, dtype=x.dtype
         )
         if x.shape[0] == 1:
-            qkernels.run_mv_lut(x[0], self.weight_data, self.lut, self.scale, out[0])
+            kernels.run_mv_lut(x[0], self.weight_data, self.lut, self.scale, out[0])
         else:
-            qkernels.run_mm_lut(x, self.weight_data, self.lut, self.scale, out)
+            kernels.run_mm_lut(x, self.weight_data, self.lut, self.scale, out)
         return out
 
     @classmethod
-    def create(cls, weight: Tensor, c: QuantisationConfig) -> "QuantisedLinear":
+    def create(
+        cls, weight: Tensor, c: QuantisationConfig, lut: Tensor | None = None
+    ) -> "QuantisedLinear":
         device = weight.device
         elements_per_byte = 8 // c.bits
+        if lut is not None:
+            assert (
+                lut.ndim == 1 and lut.shape[0] <= 2**c.bits
+            ), f"lut must have at most {2**c.bits} entries, got {lut.shape[0]}"
+            lut = nn.functional.pad(lut, (0, 2**c.bits - lut.shape[0]), value=lut[-1])
+        else:
+            # default: uniform [-1, 1]
+            lut = torch.linspace(
+                -1, 1, steps=2**c.bits, device=device, dtype=weight.dtype
+            )
 
         # Group scaling
         weight_grouped = weight.unflatten(-1, (-1, c.block_size))
@@ -78,11 +88,8 @@ class QuantisedLinear(nn.Module):
         weight_scaled = (weight_grouped / scale[..., None]).flatten(-2)
 
         # Quantisation
-        lut1 = torch.linspace(
-            -1, 1, steps=2**c.bits, device=device, dtype=torch.bfloat16
-        )
         weight_indices = torch.bucketize(
-            weight_scaled, (lut1[1:] + lut1[:-1]) / 2
+            weight_scaled, (lut[1:] + lut[:-1]) / 2
         ).clamp_(0, 2**c.bits - 1)
         multipliers = 2 ** torch.arange(
             0, 8, c.bits, device=device, dtype=torch.uint8
@@ -93,8 +100,8 @@ class QuantisedLinear(nn.Module):
             .mul(multipliers)
             .sum(-1, dtype=torch.uint8)
         )
-        lut = torch.cartesian_prod(*([lut1] * elements_per_byte)).view(256, -1)
-        return cls(*weight.T.shape, weight_data, scale, lut, kernel=c.kernel)
+        byte_lut = torch.cartesian_prod(*([lut] * elements_per_byte)).view(256, -1)
+        return cls(*weight.T.shape, weight_data, scale, byte_lut, kernel=c.kernel)
 
 
 def _create_marlin_layer(src: nn.Linear, c: QuantisationConfig) -> nn.Module:
@@ -124,6 +131,7 @@ def quantise(
     device: torch.device,
     dtype: torch.dtype,
     key: tuple[str, ...] = (),
+    lut: Tensor | None = None,
 ) -> nn.Module:
     """Quantise all nn.Linear layers in a module according to config,
     returning a new quantised module. The original module is left untouched.
@@ -148,7 +156,7 @@ def quantise(
             module = _create_marlin_layer(copy.deepcopy(source).to(dtype), config)
         else:
             module = QuantisedLinear.create(
-                source.weight.data.to(device, dtype), config
+                source.weight.data.to(device, dtype), config, lut=lut
             )
     else:
         # Shallow copy the module object (not its tensors)
@@ -180,13 +188,13 @@ def quantise(
 
 
 def test_quantise() -> None:
-    for bits, tol, kernels in [
+    for bits, tol, kernels_ in [
         (8, 0.01, ["triton", "torch.compile"]),
         (4, 0.2, ["triton", "torch.compile", "marlin", "marlin-lut"]),
         (2, 0.5, ["triton", "torch.compile"]),
         (1, 1, ["triton", "torch.compile"]),
     ]:
-        for kernel in kernels:
+        for kernel in kernels_:
             torch.manual_seed(100)
             device = torch.device("cuda")
             dtype = torch.float16 if kernel.startswith("marlin") else torch.bfloat16
@@ -202,7 +210,7 @@ def test_quantise() -> None:
             actual = module(x.to(device=device, dtype=dtype))
             assert actual.device.type == device.type, f"bad device {actual.device.type}"
             assert actual.dtype == dtype, f"bad dtype {actual.dtype}"
-            qkernels._assert_rmsen(expected, actual.cpu(), tol=tol)
+            kernels._assert_rmsen(expected, actual.cpu(), tol=tol)
 
             # check stats, while we're here
             assert count_ops(module) == 2 * 384 * 256, "bad ops count"
@@ -318,7 +326,7 @@ def benchmark(
         )
         # +3 as measure_time runs 3 "warmup/capture" iterations
         generator = Generator(model, prompt_ids, reps + 3)
-        avg_time, avg_time_stderr = qbench.measure_time(
+        avg_time, avg_time_stderr = bench.measure_time(
             lambda _: generator.step(), inner_reps=1, outer_reps=reps
         )
         # approximate operations and bytes transferred
@@ -467,7 +475,7 @@ def load_host_model(model_name: str) -> transformers.PreTrainedModel:
 
 def run_benchmark(
     settings: BenchmarkSettings,
-    log: qbench.Log,
+    log: bench.Log,
     host_model: transformers.PreTrainedModel,
 ) -> None:
     gc.collect()
@@ -509,14 +517,14 @@ def run_benchmark(
 
 
 def _quantisation_configs(
-    bits: list[int], block_sizes: list[int], kernels: list[str], skip: str
+    bits: list[int], block_sizes: list[int], kernels_: list[str], skip: str
 ) -> Iterable[QuantisationConfig]:
     if 16 in bits:
         yield None  # 16-bit (no quantisation)
     for b in bits:
         if b < 16:
             for block_size in block_sizes:
-                for kernel in kernels:
+                for kernel in kernels_:
                     if not (kernel.startswith("marlin") and b != 4):
                         yield QuantisationConfig(
                             bits=b, block_size=block_size, kernel=kernel, skip=skip
@@ -579,7 +587,7 @@ def _main() -> None:
 
     test_quantise()
 
-    with qbench.Log("models") as log:
+    with bench.Log("models") as log:
         for model in args.model:
             host_model = load_host_model(model)
             for batch_size in args.batch_size:

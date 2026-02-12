@@ -14,12 +14,12 @@
 
 
 from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.cpp_extension
-from pathlib import Path
 
 
 def _load_extension() -> object:

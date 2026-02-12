@@ -18,8 +18,7 @@ import torch
 import triton
 from torch import Tensor
 
-import qkernels
-import marlin
+from . import kernels, marlin
 
 # Utilities
 
@@ -395,17 +394,17 @@ def mm_lut_ref_unscaled(
 
 # mv
 RegisterBenchmark_mv("mv_ref", lambda a, b, out: torch.matmul(a, b.T, out=out[None]))
-RegisterBenchmark_mv("mv", qkernels.run_mv)
+RegisterBenchmark_mv("mv", kernels.run_mv)
 RegisterBenchmark_mv_lut8("mv_lut8_ref_unscaled", mm_lut_ref_unscaled)
-RegisterBenchmark_mv_lut8("mv_lut8_ref", qkernels.mm_lut_ref)
-RegisterBenchmark_mv_lut8("mv_lut8", qkernels.run_mv_lut)
+RegisterBenchmark_mv_lut8("mv_lut8_ref", kernels.mm_lut_ref)
+RegisterBenchmark_mv_lut8("mv_lut8", kernels.run_mv_lut)
 
 # mm
 RegisterBenchmark_mm("mm_ref", lambda a, b, out: torch.matmul(a, b.T, out=out))
-RegisterBenchmark_mm("mm", qkernels.run_mm)
+RegisterBenchmark_mm("mm", kernels.run_mm)
 RegisterBenchmark_mm_lut8("mm_lut8_ref_unscaled", mm_lut_ref_unscaled)
-RegisterBenchmark_mm_lut8("mm_lut8_ref", qkernels.mm_lut_ref)
-RegisterBenchmark_mm_lut8("mm_lut8", qkernels.run_mm_lut)
+RegisterBenchmark_mm_lut8("mm_lut8_ref", kernels.mm_lut_ref)
+RegisterBenchmark_mm_lut8("mm_lut8", kernels.run_mm_lut)
 
 # marlin
 RegisterBenchmark_marlin()
@@ -417,7 +416,7 @@ RegisterBenchmark_marlin()
 def run_tests() -> None:
     tests = [
         (k, v)
-        for k, v in itertools.chain(qkernels.__dict__.items(), globals().items())
+        for k, v in itertools.chain(kernels.__dict__.items(), globals().items())
         if k.startswith("test_")
     ]
     for name, fn in tests:

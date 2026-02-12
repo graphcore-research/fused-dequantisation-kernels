@@ -2,18 +2,42 @@
 
 This repository contains fused dequantisation kernels for various weight quantisation formats, along with benchmarking scripts to evaluate their performance on different models and batch sizes.
 
-Commands to run benchmarks, first of kernels, then models:
+Use the kernels:
 
 ```sh
-python src/qbench.py
-python src/qmodels.py
-
-# Long runs
-python src/qbench.py --exclude '' -b 16 8 4 2 1 -k 8192 6144 4096 3072
-python src/qmodels.py --model custom-llama-4B custom-llama-12B custom-llama-31B --batch-size 1 4 16 64 256 --kernel triton marlin-lut marlin torch.compile
+pip install git+ssh://github.com/graphcore-research/fused-dequantisation-kernels
 ```
 
-First-time setup:
+```py3
+import fdk
+import torch
+
+device, dtype = torch.device("cuda"), torch.bfloat16
+
+torch.manual_seed(100)
+ref = torch.nn.Linear(4096, 4096, bias=False).to(device, dtype)
+x = torch.randn(200, 4096).to(device, dtype)
+
+config = fdk.models.QuantisationConfig(bits=4, block_size=64)
+m = fdk.models.quantise(ref, config, device=device, dtype=dtype)
+y = m(x)
+y_ref = ref(x)
+
+print("RMSE:", (y - y_ref).float().pow(2).mean().sqrt())
+```
+
+To run benchmarks of kernels and whole models:
+
+```sh
+python -m fdk.bench
+python -m fdk.models
+
+# Long runs
+python -m fdk.bench --exclude '' -b 16 8 4 2 1 -k 8192 6144 4096 3072
+python -m fdk.models --model custom-llama-4B custom-llama-12B custom-llama-31B --batch-size 1 4 16 64 256 --kernel triton marlin-lut marlin torch.compile
+```
+
+Development/experimentation setup:
 
 ```sh
 sudo apt install ninja-build pybind11-dev
@@ -49,7 +73,7 @@ Requires `ncu`, [NVIDIA Nsight Compute](https://developer.nvidia.com/tools-overv
 
 ```sh
 mkdir -p out/profiles
-sudo $(which ncu) --kernel-name="regex:.*kernel__mv.*" --launch-skip=100 --launch-count=10 -o out/profiles/mv_lut8_4b $(which python) src/qbench.py --profile mv_lut8 -b 4
+sudo $(which ncu) --kernel-name="regex:.*kernel__mv.*" --launch-skip=100 --launch-count=10 -o out/profiles/mv_lut8_4b $(which python) -m fdk.bench --profile mv_lut8 -b 4
 ```
 
 For experimental CPU kernels, we suggest inspecting the disassembly:
@@ -61,7 +85,7 @@ ninja -C src/experimental/cpu build/bench.s
 
 ## Credits
 
-Includes code from [IST-DASLab/marlin](https://github.com/IST-DASLab/marlin), see [src/marlin/README.md](src/marlin/README.md) for details.
+Includes code from [IST-DASLab/marlin](https://github.com/IST-DASLab/marlin), see [src/fdk/marlin/README.md](src/fdk/marlin/README.md) for details.
 
 This work was based on a Marlin port to add LUT support, written by [Sohir Maskey](https://github.com/SohirMaskey).
 
