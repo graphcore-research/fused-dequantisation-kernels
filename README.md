@@ -63,7 +63,7 @@ ninja -C src/experimental/cpu build/bench.s
 
 Includes code from [IST-DASLab/marlin](https://github.com/IST-DASLab/marlin), see [src/marlin/README.md](src/marlin/README.md) for details.
 
-Our work was based on an Marlin port to add LUT support, written by [Sohir Maskey](https://github.com/SohirMaskey).
+This work was based on a Marlin port to add LUT support, written by [Sohir Maskey](https://github.com/SohirMaskey).
 
 ## License
 
