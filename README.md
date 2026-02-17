@@ -1,6 +1,8 @@
 # Fused Dequantisation Kernels
 
-This repository contains fused dequantisation kernels for various weight quantisation formats, along with benchmarking scripts to evaluate their performance on different models and batch sizes.
+This repository supplements the paper _1-Bit-Wonder: Improving QAT Performance in the Low-Bit Regime through K-Means Quantization_, and contains fused dequantisation kernels for various weight quantisation formats, along with benchmarking scripts to evaluate their performance on different models and batch sizes.
+
+For model training and evaluation code, please see the [main repository](https://github.com/Aleph-Alpha-Research/1-Bit-Wonder).
 
 Use the kernels:
 
