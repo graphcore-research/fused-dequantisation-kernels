@@ -1,8 +1,8 @@
 # Fused Dequantisation Kernels
 
-This repository supplements the paper _1-Bit-Wonder: Improving QAT Performance in the Low-Bit Regime through K-Means Quantization_, and contains fused dequantisation kernels for various weight quantisation formats, along with benchmarking scripts to evaluate their performance on different models and batch sizes.
+This repository supplements the paper [1-Bit-Wonder: Improving QAT Performance in the Low-Bit Regime through K-Means Quantization](https://arxiv.org/abs/2602.15563), and contains fused dequantisation kernels for various weight quantisation formats, along with benchmarking scripts to evaluate their performance on different models and batch sizes.
 
-For model training and evaluation code, please see the [main repository](https://github.com/Aleph-Alpha-Research/1-Bit-Wonder).
+_For model training and evaluation code, please see the [main repository](https://github.com/Aleph-Alpha-Research/1-Bit-Wonder)._
 
 Use the kernels:
 
@@ -96,3 +96,17 @@ This work was based on a Marlin port to add LUT support, written by [Sohir Maske
 Copyright (c) 2026 Graphcore Ltd. Licensed under the MIT License.
 
 See LICENSE for further details.
+
+## Citing this work
+
+```
+@misc{maskey2026_1bitwonder,
+      title={1-Bit Wonder: Improving {QAT} Performance in the Low-Bit Regime through K-Means Quantization},
+      author={Sohir Maskey and Constantin Eichenberg and Johannes Messner and Douglas Orr},
+      year={2026},
+      eprint={2602.15563},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2602.15563},
+}
+```
