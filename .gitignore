@@ -5,7 +5,7 @@ __pycache__
 .venv
 .vscode
 
-/local
+/.local
 /notebooks/out
 /notebooks/paper
 /out/dev
