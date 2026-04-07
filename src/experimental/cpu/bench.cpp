@@ -82,43 +82,14 @@ NOINLINE void memcpy(T* __restrict__ dst, const T* __restrict__ src, uint64_t n)
     }
 }
 
-float _dot(const bf16* __restrict__ a, const bf16* __restrict__ b, const uint64_t dK) {
-    constexpr auto P = 8;
-    float32x4_t acc[P];
-    // Initialize accumulators
-    for (auto p = 0; p < P; ++p) {
-        acc[p] = vmovq_n_f32(0.0f);
-    }
-    // Main loop, process 8*P elements per iteration
-    constexpr auto Stride = 8 * P;
-    const auto kStop = (dK / Stride) * Stride;
-    for (auto k = 0u; k < kStop; k += Stride) {
-        for (auto p = 0; p < P; ++p) {
-            auto ai = vld1q_bf16(a + k + p * 8);
-            auto bi = vld1q_bf16(b + k + p * 8);
-            acc[p] = vbfdotq_f32(acc[p], ai, bi);
-        }
-    }
-    // Combine accumulators
-    float result = 0.0f;
-    for (auto p = 0; p < P; ++p) {
-        result += vaddvq_f32(acc[p]);
-    }
-    // Handle remainder when dK is not a multiple of 8*P
-    for (auto k = kStop; k < dK; ++k) {
-        result += to_float(a[k]) * to_float(b[k]);
-    }
-    return result;
-}
-
 // ----------------------------------------------------------------------------
 // mv_naive
 
-void mv_naive(const bf16* __restrict__ a,  // [dK]
-              const bf16* __restrict__ b,  // [dN * dK]
-              const uint64_t dK,
-              const uint64_t dN,
-              bf16* __restrict__ out) {  // [dN]
+NOINLINE void mv_naive(const bf16* __restrict__ a,  // [dK]
+                       const bf16* __restrict__ b,  // [dN * dK]
+                       const uint64_t dK,
+                       const uint64_t dN,
+                       bf16* __restrict__ out) {  // [dN]
     for (auto n = 0u; n < dN; ++n) {
         auto sum = 0.0f;
         for (auto k = 0u; k < dK; ++k) {
@@ -315,19 +286,91 @@ NOINLINE void mv_lut(const bf16* __restrict__ a,     // [dK]
 // ----------------------------------------------------------------------------
 // mvi8_naive
 
-void mvi8_naive(const i8* __restrict__ a,     // [dK]
-                const i8* __restrict__ b,     // [dN * dK]
-                const bf16* __restrict__ as,  // [1]
-                const bf16* __restrict__ bs,  // [dN]
-                const uint64_t dK,
-                const uint64_t dN,
-                bf16* __restrict__ out) {  // [dN]
+NOINLINE void mvi8_naive(const i8* __restrict__ a,     // [dK]
+                         const i8* __restrict__ b,     // [dN * dK]
+                         const bf16* __restrict__ as,  // [1]
+                         const bf16* __restrict__ bs,  // [dN]
+                         const uint64_t dK,
+                         const uint64_t dN,
+                         bf16* __restrict__ out) {  // [dN]
     for (auto n = 0u; n < dN; ++n) {
         int32_t sum = 0;
         for (auto k = 0u; k < dK; ++k) {
             sum += int32_t(a[k]) * int32_t(b[n * dK + k]);
         }
         out[n] = to_bf16(float(sum) * to_float(as[0]) * to_float(bs[n]));
+    }
+}
+// ----------------------------------------------------------------------------
+// mvi8
+
+template <uint64_t BlockN, uint64_t BlockK>
+void _mvi8_chunk(const i8* __restrict__ a,
+                 const i8* __restrict__ b,
+                 const float a_scale,
+                 const bf16* __restrict__ bs,
+                 const uint64_t dK,
+                 bf16* __restrict__ out) {
+    constexpr auto StrideK = BlockK * 16;
+
+    // Accumulators: BlockN rows x BlockK partial sums
+    int32x4_t accs[BlockN * BlockK];
+#pragma unroll
+    for (auto i = 0u; i < BlockN * BlockK; ++i) {
+        accs[i] = vdupq_n_s32(0);
+    }
+
+    // Main loop, process [BlockN, BlockK * 16] elements of `b` per iteration
+    const auto kStop = (dK / StrideK) * StrideK;
+    for (auto k0 = 0u; k0 < kStop; k0 += StrideK) {
+#pragma unroll
+        for (auto iK = 0u; iK < BlockK; ++iK) {
+            const auto k = k0 + iK * 16;
+            int8x16_t ai = vld1q_s8(&a[k]);
+#pragma unroll
+            for (auto n = 0u; n < BlockN; ++n) {
+                int8x16_t bi = vld1q_s8(&b[n * dK + k]);
+                int32x4_t& acc = accs[n * BlockK + iK];
+                acc = vdotq_s32(acc, ai, bi);
+            }
+        }
+    }
+
+    // Accumulate partials and store results
+#pragma unroll
+    for (auto n = 0u; n < BlockN; ++n) {
+        // Sum across BlockK accumulators
+        int32x4_t& acc_n = accs[n * BlockK];
+#pragma unroll
+        for (auto iK = 1u; iK < BlockK; ++iK) {
+            acc_n = vaddq_s32(acc_n, accs[n * BlockK + iK]);
+        }
+        int32_t sum = vaddvq_s32(acc_n);
+
+        // Handle remainder when dK is not a multiple of StrideK
+        for (auto k = kStop; k < dK; ++k) {
+            sum += int32_t(a[k]) * int32_t(b[n * dK + k]);
+        }
+        out[n] = to_bf16(float(sum) * a_scale * to_float(bs[n]));
+    }
+}
+
+template <uint64_t BlockN = 8ull, uint64_t BlockK = 2ull>
+NOINLINE void mvi8(const i8* __restrict__ a,     // [dK]
+                   const i8* __restrict__ b,     // [dN * dK]
+                   const bf16* __restrict__ as,  // [1]
+                   const bf16* __restrict__ bs,  // [dN]
+                   const uint64_t dK,
+                   const uint64_t dN,
+                   bf16* __restrict__ out) {  // [dN]
+    const auto a_scale = to_float(as[0]);
+    const auto nStop = BlockN * (dN / BlockN);
+#pragma omp parallel for
+    for (auto n = 0ull; n < nStop; n += BlockN) {
+        _mvi8_chunk<BlockN, BlockK>(a, &b[n * dK], a_scale, &bs[n], dK, &out[n]);
+    }
+    for (auto n = nStop; n < dN; ++n) {
+        _mvi8_chunk<1, BlockK>(a, &b[n * dK], a_scale, &bs[n], dK, &out[n]);
     }
 }
 
@@ -615,22 +658,23 @@ void test_kernel_mvi8() {
     std::vector<bf16> expected(dN);
     kernels::mvi8_naive(ai8.data.data(), bi8.data.data(), ai8.scale.data(), bi8.scale.data(), dK,
                         dN, expected.data());
-    std::cerr << "RMSE norm: " << rmse_norm(original, expected) << "\n";
+
+    std::vector<bf16> actual(dN);
+    kernels::mvi8(ai8.data.data(), bi8.data.data(), ai8.scale.data(), bi8.scale.data(), dK, dN,
+                  actual.data());
+
+    EXPECT_CLOSE(original, actual, 0.05);
+    EXPECT_EQ(expected, actual, 1e-3f);
 }
 
-void test_all() {
-    std::cerr << "### Running tests\n\n";
-    auto success = true;
-    for (auto test : {&test_kernel_mv, &test_kernel_mv_lut, &test_kernel_mvi8}) {
-        try {
-            test();
-        } catch (const std::exception& e) {
-            std::cerr << "--> Test failed: " << e.what() << "\n\n" << std::flush;
-            success = false;
-        }
-    }
-    if (success) {
-        std::cerr << "---> Tests passed\n\n" << std::flush;
+bool all_tests_passed = true;
+#define RUN_TEST(test) tests::run_test(test, #test);
+void run_test(const std::function<void()>& test, const std::string& test_name) {
+    try {
+        test();
+    } catch (const std::exception& e) {
+        std::cerr << "--> " << test_name << " failed: " << e.what() << "\n\n" << std::flush;
+        all_tests_passed = false;
     }
 }
 
@@ -761,6 +805,41 @@ void benchmark_mv_lut() {
     std::cerr << "\n";
 }
 
+void benchmark_mvi8() {
+    std::cerr << "### benchmark_mvi8\n";
+
+    const std::vector<std::tuple<uint64_t, uint64_t>> sizes = {
+        {4096, 4096},
+        {8192, 8192},
+    };
+    const uint64_t reps = 16;
+
+    for (const auto& size : sizes) {
+        auto dK = std::get<0>(size), dN = std::get<1>(size);
+
+        // Allocate
+        auto copies = std::max<uint64_t>(1, (1ull << 30) / (dN * dK * sizeof(i8)));
+        std::vector<i8> a(copies * dK, i8(64));
+        std::vector<i8> b(copies * dN * dK, i8(64));
+        std::vector<bf16> as(copies, bf16(0.5f / 64.0f));
+        std::vector<bf16> bs(copies * dN, bf16(0.5f / 64.0f));
+        std::vector<bf16> out(copies * dN);
+
+        // Benchmark
+        auto s = measure_time(reps, [&](uint64_t i) {
+            auto idx = i % copies;
+            kernels::mvi8(&a[idx * dK], &b[idx * dN * dK], &as[idx], &bs[idx * dN], dK, dN,
+                          &out[idx * dN]);
+        });
+        double bytes = double(dK * sizeof(i8) + dN * dK * sizeof(i8) + sizeof(bf16) +
+                              dN * sizeof(bf16) + dN * sizeof(bf16));
+        double gbs = bytes / (s.avg_time * 1e9);
+        std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n",
+                                 std::format("{} x {}", dK, dN), s.avg_time * 1e3, gbs);
+    }
+    std::cerr << "\n";
+}
+
 }  // namespace benchmarks
 
 // ----------------------------------------------------------------------------
@@ -776,11 +855,15 @@ int main() {
     std::cerr << std::format("# SVE vector length: {} bits\n", 8 * svcntb());
     std::cerr << "\n";
 
-    tests::test_all();
+    RUN_TEST(tests::test_kernel_mv);
+    RUN_TEST(tests::test_kernel_mv_lut);
+    RUN_TEST(tests::test_kernel_mvi8);
+    std::cerr << "### Tests " << (tests::all_tests_passed ? "PASSED" : "FAILED") << "\n\n";
 
     benchmarks::benchmark_memcpy();
     benchmarks::benchmark_mv();
     benchmarks::benchmark_mv_lut();
+    benchmarks::benchmark_mvi8();
 
     return 0;
 }
