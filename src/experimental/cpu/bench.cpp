@@ -301,6 +301,7 @@ NOINLINE void mvi8_naive(const i8* __restrict__ a,     // [dK]
         out[n] = to_bf16(float(sum) * to_float(as[0]) * to_float(bs[n]));
     }
 }
+
 // ----------------------------------------------------------------------------
 // mvi8
 
@@ -351,6 +352,8 @@ void _mvi8_chunk(const i8* __restrict__ a,
         for (auto k = kStop; k < dK; ++k) {
             sum += int32_t(a[k]) * int32_t(b[n * dK + k]);
         }
+
+        // Store
         out[n] = to_bf16(float(sum) * a_scale * to_float(bs[n]));
     }
 }
@@ -371,6 +374,117 @@ NOINLINE void mvi8(const i8* __restrict__ a,     // [dK]
     }
     for (auto n = nStop; n < dN; ++n) {
         _mvi8_chunk<1, BlockK>(a, &b[n * dK], a_scale, &bs[n], dK, &out[n]);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// mvi8_lut3
+
+// b is packed with 3 values per byte
+// - each of the 3 values correspond to different rows (along dN)
+// - each byte is a 5-bit index into lut, then a 3-bit sign vector for the 3 values
+template <uint64_t BlockN, uint64_t BlockK>
+void _mvi8_lut3_chunk(const i8* __restrict__ a,
+                      const uint8_t* __restrict__ b,
+                      const uint8x16x2_t* __restrict__ lut_tables,
+                      const i8* __restrict__ lut,
+                      const float a_scale,
+                      const bf16* __restrict__ bs,
+                      const uint64_t dK,
+                      bf16* __restrict__ out) {
+    constexpr auto RowsPerPack = 3u;
+    constexpr auto StrideK = BlockK * 16;
+
+    int32x4_t accs[BlockN * RowsPerPack * BlockK];
+#pragma unroll
+    for (auto i = 0u; i < BlockN * RowsPerPack * BlockK; ++i) {
+        accs[i] = vdupq_n_s32(0);
+    }
+
+    const auto k_stop = (dK / StrideK) * StrideK;
+    const auto lut_mask = vdupq_n_u8(0x1F);
+    const auto sign_masks =
+        std::array<uint8x16_t, RowsPerPack>{vdupq_n_u8(0x20), vdupq_n_u8(0x40), vdupq_n_u8(0x80)};
+    for (auto k0 = 0u; k0 < k_stop; k0 += StrideK) {
+#pragma unroll
+        for (auto iK = 0u; iK < BlockK; ++iK) {
+            const auto k = k0 + iK * 16;
+            int8x16_t ai = vld1q_s8(&a[k]);
+#pragma unroll
+            for (auto n = 0u; n < BlockN; ++n) {
+                uint8x16_t packed = vld1q_u8(&b[n * dK + k]);
+                uint8x16_t idx = vandq_u8(packed, lut_mask);
+#pragma unroll
+                for (auto row = 0u; row < RowsPerPack; ++row) {
+                    int8x16_t values = vreinterpretq_s8_u8(vqtbl2q_u8(lut_tables[row], idx));
+                    uint8x16_t sign = vceqq_u8(vandq_u8(packed, sign_masks[row]), sign_masks[row]);
+                    int8x16_t signed_values = vreinterpretq_s8_u8(vbslq_u8(
+                        sign, vreinterpretq_u8_s8(vnegq_s8(values)), vreinterpretq_u8_s8(values)));
+                    int32x4_t& acc = accs[(n * RowsPerPack + row) * BlockK + iK];
+                    acc = vdotq_s32(acc, ai, signed_values);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (auto iN = 0u; iN < BlockN; ++iN) {
+#pragma unroll
+        for (auto row = 0u; row < RowsPerPack; ++row) {
+            const auto n = iN * RowsPerPack + row;
+
+            // Sum across BlockK accumulators for this row
+            int32x4_t& acc_n = accs[(iN * RowsPerPack + row) * BlockK];
+#pragma unroll
+            for (auto iK = 1u; iK < BlockK; ++iK) {
+                acc_n = vaddq_s32(acc_n, accs[(iN * RowsPerPack + row) * BlockK + iK]);
+            }
+            int32_t sum = vaddvq_s32(acc_n);
+
+            // Handle remainder when dK is not a multiple of StrideK
+            for (auto k = k_stop; k < dK; ++k) {
+                uint8_t packed = b[iN * dK + k];
+                uint8_t lut_index = packed & 0x1Fu;
+                uint8_t signs = packed >> 5;
+                int32_t value = int32_t((signs & (1u << row)) ? -lut[3 * row + lut_index]
+                                                              : lut[3 * row + lut_index]);
+                sum += int32_t(a[k]) * value;
+            }
+
+            // Store
+            out[n] = to_bf16(float(sum) * a_scale * to_float(bs[n]));
+        }
+    }
+}
+
+template <uint64_t BlockN = 2ull, uint64_t BlockK = 1ull>
+NOINLINE void mvi8_lut3(const i8* __restrict__ a,       // [dK]
+                        const uint8_t* __restrict__ b,  // packed tensor [(dN / 3) * dK]
+                        const i8* __restrict__ lut,     // [3 * 32]
+                        const bf16* __restrict__ as,    // [1]
+                        const bf16* __restrict__ bs,    // [dN]
+                        const uint64_t dK,
+                        const uint64_t dN,         // padded to multiple of 3
+                        bf16* __restrict__ out) {  // [dN]
+    constexpr auto RowsPerPack = 3ull;
+    constexpr auto BlockRows = RowsPerPack * BlockN;
+    const auto a_scale = to_float(as[0]);
+
+    const auto lut_u = reinterpret_cast<const uint8_t*>(lut);
+    const std::array<uint8x16x2_t, RowsPerPack> lut_tables = {
+        uint8x16x2_t{vld1q_u8(&lut_u[0]), vld1q_u8(&lut_u[16])},
+        uint8x16x2_t{vld1q_u8(&lut_u[32]), vld1q_u8(&lut_u[48])},
+        uint8x16x2_t{vld1q_u8(&lut_u[64]), vld1q_u8(&lut_u[80])},
+    };
+    const auto nStop = BlockRows * (dN / BlockRows);
+#pragma omp parallel for
+    for (auto n = 0ull; n < nStop; n += BlockRows) {
+        _mvi8_lut3_chunk<BlockN, BlockK>(a, &b[(n / RowsPerPack) * dK], lut_tables.data(), lut,
+                                         a_scale, &bs[n], dK, &out[n]);
+    }
+    for (auto n = nStop; n < dN; n += RowsPerPack) {
+        _mvi8_lut3_chunk<1, BlockK>(a, &b[(n / RowsPerPack) * dK], lut_tables.data(), lut, a_scale,
+                                    &bs[n], dK, &out[n]);
     }
 }
 
@@ -831,7 +945,54 @@ void benchmark_mvi8() {
             kernels::mvi8(&a[idx * dK], &b[idx * dN * dK], &as[idx], &bs[idx * dN], dK, dN,
                           &out[idx * dN]);
         });
-        double bytes = double(dK * sizeof(i8) + dN * dK * sizeof(i8) + sizeof(bf16) +
+        double bytes =
+            double(dK * sizeof(i8) + dN * dK * sizeof(i8) + dN * sizeof(bf16) + dN * sizeof(bf16));
+        double gbs = bytes / (s.avg_time * 1e9);
+        std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n",
+                                 std::format("{} x {}", dK, dN), s.avg_time * 1e3, gbs);
+    }
+    std::cerr << "\n";
+}
+
+void benchmark_mvi8_lut3() {
+    std::cerr << "### benchmark_mvi8_lut3\n";
+
+    const std::vector<std::tuple<uint64_t, uint64_t>> sizes = {
+        {4096, 4096},
+        {8192, 8192},
+    };
+    const uint64_t reps = 16;
+
+    for (const auto& size : sizes) {
+        auto dK = std::get<0>(size), dN = std::get<1>(size);
+        const auto dN_pad = (dN + 2) / 3;
+
+        // Allocate
+        auto copies = std::max<uint64_t>(1, (1ull << 30) / ((dN_pad / 3) * dK * sizeof(uint8_t)));
+        std::vector<i8> a(copies * dK, i8(64));
+        std::vector<uint8_t> b(copies * dN_pad * dK, uint8_t(0));
+        std::vector<i8> lut(3 * 32, i8(0));
+        std::vector<bf16> as(copies, bf16(0.5f / 64.0f));
+        std::vector<bf16> bs(copies * dN, bf16(0.5f / 64.0f));
+        std::vector<bf16> out(copies * dN);
+        for (auto i = 0u; i < 32u; ++i) {
+            lut[0 * 32 + i] = static_cast<i8>((int(i) % 15) - 7);
+            lut[1 * 32 + i] = static_cast<i8>(((int(i) + 5) % 15) - 7);
+            lut[2 * 32 + i] = static_cast<i8>(((int(i) + 10) % 15) - 7);
+        }
+        for (auto idx = 0ull; idx < b.size(); ++idx) {
+            const auto lut_index = uint8_t(idx % 32ull);
+            const auto sign_bits = uint8_t(((idx / 32ull) % 8ull) << 5);
+            b[idx] = uint8_t(lut_index | sign_bits);
+        }
+
+        // Benchmark
+        auto s = measure_time(reps, [&](uint64_t i) {
+            auto idx = i % copies;
+            kernels::mvi8_lut3(&a[idx * dK], &b[idx * dN_pad * dK], lut.data(), &as[idx],
+                               &bs[idx * dN], dK, dN, &out[idx * dN]);
+        });
+        double bytes = double(dK * sizeof(i8) + (dN_pad / 3) * dK * sizeof(uint8_t) +
                               dN * sizeof(bf16) + dN * sizeof(bf16));
         double gbs = bytes / (s.avg_time * 1e9);
         std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n",
@@ -864,6 +1025,7 @@ int main() {
     benchmarks::benchmark_mv();
     benchmarks::benchmark_mv_lut();
     benchmarks::benchmark_mvi8();
+    benchmarks::benchmark_mvi8_lut3();
 
     return 0;
 }
