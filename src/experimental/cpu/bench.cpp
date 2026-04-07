@@ -386,7 +386,7 @@ NOINLINE void mvi8(const i8* __restrict__ a,     // [dK]
 template <uint64_t BlockN, uint64_t BlockK>
 void _mvi8_lut3_chunk(const i8* __restrict__ a,
                       const uint8_t* __restrict__ b,
-                      const uint8x16x2_t* __restrict__ lut_tables,
+                      const int8x16x4_t* __restrict__ lut_tables,
                       const i8* __restrict__ lut,
                       const float a_scale,
                       const bf16* __restrict__ bs,
@@ -402,9 +402,6 @@ void _mvi8_lut3_chunk(const i8* __restrict__ a,
     }
 
     const auto k_stop = (dK / StrideK) * StrideK;
-    const auto lut_mask = vdupq_n_u8(0x1F);
-    const auto sign_masks =
-        std::array<uint8x16_t, RowsPerPack>{vdupq_n_u8(0x20), vdupq_n_u8(0x40), vdupq_n_u8(0x80)};
     for (auto k0 = 0u; k0 < k_stop; k0 += StrideK) {
 #pragma unroll
         for (auto iK = 0u; iK < BlockK; ++iK) {
@@ -413,15 +410,20 @@ void _mvi8_lut3_chunk(const i8* __restrict__ a,
 #pragma unroll
             for (auto n = 0u; n < BlockN; ++n) {
                 uint8x16_t packed = vld1q_u8(&b[n * dK + k]);
-                uint8x16_t idx = vandq_u8(packed, lut_mask);
-#pragma unroll
-                for (auto row = 0u; row < RowsPerPack; ++row) {
-                    int8x16_t values = vreinterpretq_s8_u8(vqtbl2q_u8(lut_tables[row], idx));
-                    uint8x16_t sign = vceqq_u8(vandq_u8(packed, sign_masks[row]), sign_masks[row]);
-                    int8x16_t signed_values = vreinterpretq_s8_u8(vbslq_u8(
-                        sign, vreinterpretq_u8_s8(vnegq_s8(values)), vreinterpretq_u8_s8(values)));
-                    int32x4_t& acc = accs[(n * RowsPerPack + row) * BlockK + iK];
-                    acc = vdotq_s32(acc, ai, signed_values);
+                uint8x16_t idx0 = vandq_u8(packed, vdupq_n_u8(0x3F));
+                uint8x16_t idx1 = vandq_u8(vshrq_n_u8(packed, 1), vdupq_n_u8(0x3F));
+                uint8x16_t idx2 = veorq_u8(idx0, vshrq_n_u8(packed, 7));
+                {  // row=0
+                    int32x4_t& acc = accs[(n * RowsPerPack + 0) * BlockK + iK];
+                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(lut_tables[0], idx0));
+                }
+                {  // row=1
+                    int32x4_t& acc = accs[(n * RowsPerPack + 1) * BlockK + iK];
+                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(lut_tables[1], idx1));
+                }
+                {  // row=2
+                    int32x4_t& acc = accs[(n * RowsPerPack + 2) * BlockK + iK];
+                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(lut_tables[2], idx2));
                 }
             }
         }
@@ -444,11 +446,15 @@ void _mvi8_lut3_chunk(const i8* __restrict__ a,
             // Handle remainder when dK is not a multiple of StrideK
             for (auto k = k_stop; k < dK; ++k) {
                 uint8_t packed = b[iN * dK + k];
-                uint8_t lut_index = packed & 0x1Fu;
-                uint8_t signs = packed >> 5;
-                int32_t value = int32_t((signs & (1u << row)) ? -lut[3 * row + lut_index]
-                                                              : lut[3 * row + lut_index]);
-                sum += int32_t(a[k]) * value;
+                uint8_t idx;
+                if (row == 0) {
+                    idx = packed & 0x3F;
+                } else if (row == 1) {
+                    idx = (packed >> 1) & 0x3F;
+                } else {
+                    idx = (packed >> 7) ^ (packed & 0x3F);
+                }
+                sum += int32_t(a[k]) * lut[row * 64 + idx];
             }
 
             // Store
@@ -457,10 +463,10 @@ void _mvi8_lut3_chunk(const i8* __restrict__ a,
     }
 }
 
-template <uint64_t BlockN = 2ull, uint64_t BlockK = 1ull>
+template <uint64_t BlockN = 1ull, uint64_t BlockK = 2ull>
 NOINLINE void mvi8_lut3(const i8* __restrict__ a,       // [dK]
                         const uint8_t* __restrict__ b,  // packed tensor [(dN / 3) * dK]
-                        const i8* __restrict__ lut,     // [3 * 32]
+                        const i8* __restrict__ lut,     // [3 * 64]
                         const bf16* __restrict__ as,    // [1]
                         const bf16* __restrict__ bs,    // [dN]
                         const uint64_t dK,
@@ -470,11 +476,12 @@ NOINLINE void mvi8_lut3(const i8* __restrict__ a,       // [dK]
     constexpr auto BlockRows = RowsPerPack * BlockN;
     const auto a_scale = to_float(as[0]);
 
-    const auto lut_u = reinterpret_cast<const uint8_t*>(lut);
-    const std::array<uint8x16x2_t, RowsPerPack> lut_tables = {
-        uint8x16x2_t{vld1q_u8(&lut_u[0]), vld1q_u8(&lut_u[16])},
-        uint8x16x2_t{vld1q_u8(&lut_u[32]), vld1q_u8(&lut_u[48])},
-        uint8x16x2_t{vld1q_u8(&lut_u[64]), vld1q_u8(&lut_u[80])},
+    const std::array<int8x16x4_t, RowsPerPack> lut_tables = {
+        int8x16x4_t{vld1q_s8(&lut[0]), vld1q_s8(&lut[16]), vld1q_s8(&lut[32]), vld1q_s8(&lut[48])},
+        int8x16x4_t{vld1q_s8(&lut[64]), vld1q_s8(&lut[80]), vld1q_s8(&lut[96]),
+                    vld1q_s8(&lut[112])},
+        int8x16x4_t{vld1q_s8(&lut[128]), vld1q_s8(&lut[144]), vld1q_s8(&lut[160]),
+                    vld1q_s8(&lut[176])},
     };
     const auto nStop = BlockRows * (dN / BlockRows);
 #pragma omp parallel for
@@ -971,19 +978,20 @@ void benchmark_mvi8_lut3() {
         auto copies = std::max<uint64_t>(1, (1ull << 30) / ((dN_pad / 3) * dK * sizeof(uint8_t)));
         std::vector<i8> a(copies * dK, i8(64));
         std::vector<uint8_t> b(copies * dN_pad * dK, uint8_t(0));
-        std::vector<i8> lut(3 * 32, i8(0));
+        std::vector<i8> lut(3 * 64, i8(0));
         std::vector<bf16> as(copies, bf16(0.5f / 64.0f));
         std::vector<bf16> bs(copies * dN, bf16(0.5f / 64.0f));
         std::vector<bf16> out(copies * dN);
-        for (auto i = 0u; i < 32u; ++i) {
-            lut[0 * 32 + i] = static_cast<i8>((int(i) % 15) - 7);
-            lut[1 * 32 + i] = static_cast<i8>(((int(i) + 5) % 15) - 7);
-            lut[2 * 32 + i] = static_cast<i8>(((int(i) + 10) % 15) - 7);
+        for (auto i = 0u; i < 64u; ++i) {
+            lut[0 * 64 + i] = static_cast<i8>((int(i) % 15) - 7);
+            lut[1 * 64 + i] = static_cast<i8>(((int(i) + 5) % 15) - 7);
+            lut[2 * 64 + i] = static_cast<i8>(((int(i) + 10) % 15) - 7);
         }
         for (auto idx = 0ull; idx < b.size(); ++idx) {
             const auto lut_index = uint8_t(idx % 32ull);
             const auto sign_bits = uint8_t(((idx / 32ull) % 8ull) << 5);
-            b[idx] = uint8_t(lut_index | sign_bits);
+            b[idx] = uint8_t((sign_bits & 0x01) | lut_index | ((sign_bits & 0x02) << 5) |
+                             ((sign_bits & 0x04) << 5));
         }
 
         // Benchmark
