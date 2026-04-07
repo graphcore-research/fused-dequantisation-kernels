@@ -483,15 +483,134 @@ NOINLINE void mvi8_lut3(const i8* __restrict__ a,       // [dK]
         int8x16x4_t{vld1q_s8(&lut[128]), vld1q_s8(&lut[144]), vld1q_s8(&lut[160]),
                     vld1q_s8(&lut[176])},
     };
-    const auto nStop = BlockRows * (dN / BlockRows);
+    const auto n_stop = BlockRows * (dN / BlockRows);
 #pragma omp parallel for
-    for (auto n = 0ull; n < nStop; n += BlockRows) {
+    for (auto n = 0ull; n < n_stop; n += BlockRows) {
         _mvi8_lut3_chunk<BlockN, BlockK>(a, &b[(n / RowsPerPack) * dK], lut_tables.data(), lut,
                                          a_scale, &bs[n], dK, &out[n]);
     }
-    for (auto n = nStop; n < dN; n += RowsPerPack) {
+    for (auto n = n_stop; n < dN; n += RowsPerPack) {
         _mvi8_lut3_chunk<1, BlockK>(a, &b[(n / RowsPerPack) * dK], lut_tables.data(), lut, a_scale,
                                     &bs[n], dK, &out[n]);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// mvi8_lut2
+
+template <uint64_t BlockN, uint64_t BlockK>
+void _mvi8_lut2_chunk(const i8* __restrict__ a,
+                      const uint8_t* __restrict__ b,
+                      const int8x16x4_t* __restrict__ lut_tables,
+                      const i8* __restrict__ lut,
+                      const float a_scale,
+                      const bf16* __restrict__ bs,
+                      const uint64_t dK,
+                      bf16* __restrict__ out) {
+    constexpr auto RowsPerPack = 8u;
+    constexpr auto StrideK = BlockK * 16;
+
+    int32x4_t accs[BlockN * RowsPerPack * BlockK];
+#pragma unroll
+    for (auto i = 0u; i < BlockN * RowsPerPack * BlockK; ++i) {
+        accs[i] = vdupq_n_s32(0);
+    }
+
+    const auto k_stop = (dK / StrideK) * StrideK;
+    for (auto k0 = 0u; k0 < k_stop; k0 += StrideK) {
+#pragma unroll
+        for (auto iK = 0u; iK < BlockK; ++iK) {
+            const auto k = k0 + iK * 16;
+            int8x16_t ai = vld1q_s8(&a[k]);
+#pragma unroll
+            for (auto iN = 0u; iN < BlockN; ++iN) {
+                const auto packed = vld3q_u8(&b[iN * 3 * dK + 3 * k]);
+                const auto idx0 = vandq_u8(packed.val[0], vdupq_n_u8(0x3F));
+                const auto idx1 =
+                    vorrq_u8(vshrq_n_u8(packed.val[0], 6),
+                             vshlq_n_u8(vandq_u8(packed.val[1], vdupq_n_u8(0x0F)), 2));
+                const auto idx2 =
+                    vorrq_u8(vshrq_n_u8(packed.val[1], 4),
+                             vshlq_n_u8(vandq_u8(packed.val[2], vdupq_n_u8(0x03)), 4));
+                const auto idx3 = vshrq_n_u8(packed.val[2], 2);
+                const auto idxs = std::array<uint8x16_t, 4>{idx0, idx1, idx2, idx3};
+
+#pragma unroll
+                for (auto jN = 0u; jN < RowsPerPack; ++jN) {
+                    int32x4_t& acc = accs[(iN * RowsPerPack + jN) * BlockK + iK];
+                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(lut_tables[jN % 2], idxs[jN / 2]));
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (auto iN = 0u; iN < BlockN; ++iN) {
+#pragma unroll
+        for (auto row = 0u; row < RowsPerPack; ++row) {
+            const auto n = iN * RowsPerPack + row;
+
+            // Sum across BlockK accumulators for this row
+            int32x4_t& acc_n = accs[(iN * RowsPerPack + row) * BlockK];
+#pragma unroll
+            for (auto iK = 1u; iK < BlockK; ++iK) {
+                acc_n = vaddq_s32(acc_n, accs[(iN * RowsPerPack + row) * BlockK + iK]);
+            }
+            int32_t sum = vaddvq_s32(acc_n);
+
+            // Handle remainder when dK is not a multiple of StrideK
+            for (auto k = k_stop; k < dK; ++k) {
+                const auto b0 = b[iN * 3 * dK + 3 * k + 0];
+                const auto b1 = b[iN * 3 * dK + 3 * k + 1];
+                const auto b2 = b[iN * 3 * dK + 3 * k + 2];
+                const auto pair = row / 2;
+                uint8_t idx;
+                if (pair == 0) {
+                    idx = b0 & 0x3F;
+                } else if (pair == 1) {
+                    idx = uint8_t((b0 >> 6) | ((b1 & 0x0F) << 2));
+                } else if (pair == 2) {
+                    idx = uint8_t((b1 >> 4) | ((b2 & 0x03) << 4));
+                } else {
+                    idx = uint8_t(b2 >> 2);
+                }
+                sum += int32_t(a[k]) * int32_t(lut[(row % 2) * 64u + idx]);
+            }
+
+            // Store
+            out[n] = to_bf16(float(sum) * a_scale * to_float(bs[n]));
+        }
+    }
+}
+
+template <uint64_t BlockN = 1ull, uint64_t BlockK = 1ull>
+NOINLINE void mvi8_lut2(const i8* __restrict__ a,       // [dK]
+                        const uint8_t* __restrict__ b,  // packed tensor [(dN / 8)*3 * dK]
+                        const i8* __restrict__ lut,     // [2 * 64]
+                        const bf16* __restrict__ as,    // [1]
+                        const bf16* __restrict__ bs,    // [dN]
+                        const uint64_t dK,
+                        const uint64_t dN,         // padded to multiple of 8
+                        bf16* __restrict__ out) {  // [dN]
+    constexpr auto RowsPerPack = 8ull;
+    constexpr auto BlockRows = RowsPerPack * BlockN;
+    const auto a_scale = to_float(as[0]);
+
+    const std::array<int8x16x4_t, 2> lut_tables = {
+        int8x16x4_t{vld1q_s8(&lut[0]), vld1q_s8(&lut[16]), vld1q_s8(&lut[32]), vld1q_s8(&lut[48])},
+        int8x16x4_t{vld1q_s8(&lut[64]), vld1q_s8(&lut[80]), vld1q_s8(&lut[96]),
+                    vld1q_s8(&lut[112])},
+    };
+
+    const auto n_stop = BlockRows * (dN / BlockRows);
+#pragma omp parallel for
+    for (auto n = 0ull; n < n_stop; n += BlockRows) {
+        _mvi8_lut2_chunk<BlockN, BlockK>(a, &b[(n / RowsPerPack) * 3ull * dK], lut_tables.data(),
+                                         lut, a_scale, &bs[n], dK, &out[n]);
+    }
+    for (auto n = n_stop; n < dN; n += RowsPerPack) {
+        _mvi8_lut2_chunk<1, BlockK>(a, &b[(n / RowsPerPack) * 3ull * dK], lut_tables.data(), lut,
+                                    a_scale, &bs[n], dK, &out[n]);
     }
 }
 
@@ -972,7 +1091,7 @@ void benchmark_mvi8_lut3() {
 
     for (const auto& size : sizes) {
         auto dK = std::get<0>(size), dN = std::get<1>(size);
-        const auto dN_pad = (dN + 2) / 3;
+        const auto dN_pad = ((dN + 2) / 3) * 3;
 
         // Allocate
         auto copies = std::max<uint64_t>(1, (1ull << 30) / ((dN_pad / 3) * dK * sizeof(uint8_t)));
@@ -980,8 +1099,8 @@ void benchmark_mvi8_lut3() {
         std::vector<uint8_t> b(copies * dN_pad * dK, uint8_t(0));
         std::vector<i8> lut(3 * 64, i8(0));
         std::vector<bf16> as(copies, bf16(0.5f / 64.0f));
-        std::vector<bf16> bs(copies * dN, bf16(0.5f / 64.0f));
-        std::vector<bf16> out(copies * dN);
+        std::vector<bf16> bs(copies * dN_pad, bf16(0.5f / 64.0f));
+        std::vector<bf16> out(copies * dN_pad);
         for (auto i = 0u; i < 64u; ++i) {
             lut[0 * 64 + i] = static_cast<i8>((int(i) % 15) - 7);
             lut[1 * 64 + i] = static_cast<i8>(((int(i) + 5) % 15) - 7);
@@ -998,9 +1117,58 @@ void benchmark_mvi8_lut3() {
         auto s = measure_time(reps, [&](uint64_t i) {
             auto idx = i % copies;
             kernels::mvi8_lut3(&a[idx * dK], &b[idx * dN_pad * dK], lut.data(), &as[idx],
-                               &bs[idx * dN], dK, dN, &out[idx * dN]);
+                               &bs[idx * dN_pad], dK, dN, &out[idx * dN_pad]);
         });
         double bytes = double(dK * sizeof(i8) + (dN_pad / 3) * dK * sizeof(uint8_t) +
+                              dN * sizeof(bf16) + dN * sizeof(bf16));
+        double gbs = bytes / (s.avg_time * 1e9);
+        std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n",
+                                 std::format("{} x {}", dK, dN), s.avg_time * 1e3, gbs);
+    }
+    std::cerr << "\n";
+}
+
+void benchmark_mvi8_lut2() {
+    std::cerr << "### benchmark_mvi8_lut2\n";
+
+    const std::vector<std::tuple<uint64_t, uint64_t>> sizes = {
+        {4096, 4096},
+        {8192, 8192},
+    };
+    const uint64_t reps = 16;
+
+    for (const auto& size : sizes) {
+        auto dK = std::get<0>(size), dN = std::get<1>(size);
+
+        auto copies =
+            std::max<uint64_t>(1, (1ull << 30) / ((dN / 8) * 3ull * dK * sizeof(uint8_t)));
+        std::vector<i8> a(copies * dK, i8(64));
+        std::vector<uint8_t> b(copies * (dN / 8) * 3ull * dK, uint8_t(0));
+        std::vector<i8> lut(2 * 64, i8(0));
+        std::vector<bf16> as(copies, bf16(0.5f / 64.0f));
+        std::vector<bf16> bs(copies * dN, bf16(0.5f / 64.0f));
+        std::vector<bf16> out(copies * dN);
+
+        for (auto i = 0u; i < 64u; ++i) {
+            lut[0 * 64 + i] = static_cast<i8>((int(i) % 15) - 7);
+            lut[1 * 64 + i] = static_cast<i8>(((int(i) + 5) % 15) - 7);
+        }
+        for (auto idx = 0ull; idx < (dN / 8) * dK * copies; ++idx) {
+            const auto idx0 = uint8_t((idx + 0) % 64ull);
+            const auto idx1 = uint8_t((idx + 1) % 64ull);
+            const auto idx2 = uint8_t((idx + 2) % 64ull);
+            const auto idx3 = uint8_t((idx + 3) % 64ull);
+            b[3 * idx + 0] = uint8_t((idx0 & 0x3Fu) | uint8_t((idx1 & 0x03u) << 6));
+            b[3 * idx + 1] = uint8_t(((idx1 >> 2) & 0x0Fu) | uint8_t((idx2 & 0x0Fu) << 4));
+            b[3 * idx + 2] = uint8_t(((idx2 >> 4) & 0x03u) | uint8_t((idx3 & 0x3Fu) << 2));
+        }
+
+        auto s = measure_time(reps, [&](uint64_t i) {
+            auto idx = i % copies;
+            kernels::mvi8_lut2(&a[idx * dK], &b[idx * ((dN / 8) * 3ull * dK)], lut.data(), &as[idx],
+                               &bs[idx * dN], dK, dN, &out[idx * dN]);
+        });
+        double bytes = double(dK * sizeof(i8) + (dN / 8) * 3ull * dK * sizeof(uint8_t) +
                               dN * sizeof(bf16) + dN * sizeof(bf16));
         double gbs = bytes / (s.avg_time * 1e9);
         std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n",
@@ -1034,6 +1202,7 @@ int main() {
     benchmarks::benchmark_mv_lut();
     benchmarks::benchmark_mvi8();
     benchmarks::benchmark_mvi8_lut3();
+    benchmarks::benchmark_mvi8_lut2();
 
     return 0;
 }
