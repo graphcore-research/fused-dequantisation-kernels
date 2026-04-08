@@ -22,7 +22,11 @@
 #include <arm_sve.h>
 #include <omp.h>
 
+// ----------------------------------------------------------------------------
+// Utilities
+
 #define NOINLINE __attribute__((noinline))
+
 using bf16 = __bf16;
 using i8 = int8_t;
 
@@ -74,6 +78,9 @@ std::ostream& operator<<(std::ostream& out, uint8x8_t v) {
 
 namespace kernels {
 
+// ----------------------------------------------------------------------------
+// memcpy
+
 template <class T>
 NOINLINE void memcpy(T* __restrict__ dst, const T* __restrict__ src, uint64_t n) {
 #pragma omp parallel for
@@ -116,17 +123,15 @@ void _mv_chunk(const bf16* __restrict__ a,
         accs[i] = vmovq_n_f32(0.0f);
     }
     // Main loop, process [BlockN, BlockK * 8] elements of `b` per iteration
-    constexpr auto StrideK = BlockK * 8;
-    const auto kStop = (dK / StrideK) * StrideK;
-    for (auto k0 = 0u; k0 < kStop; k0 += StrideK) {
+    for (auto k0 = 0u; k0 < dK; k0 += BlockK * 8) {
 #pragma unroll
         for (auto iK = 0u; iK < BlockK; ++iK) {
             auto k = k0 + iK * 8;
-            auto ai = vld1q_bf16(&a[k]);
+            bfloat16x8_t ai = vld1q_bf16(&a[k]);
 #pragma unroll
             for (auto n = 0u; n < BlockN; ++n) {
-                auto bi = vld1q_bf16(&b[n * dK + k]);
-                auto& acc = accs[n * BlockK + iK];
+                bfloat16x8_t bi = vld1q_bf16(&b[n * dK + k]);
+                float32x4_t& acc = accs[n * BlockK + iK];
                 acc = vbfdotq_f32(acc, ai, bi);
             }
         }
@@ -135,34 +140,32 @@ void _mv_chunk(const bf16* __restrict__ a,
 #pragma unroll
     for (auto n = 0u; n < BlockN; ++n) {
         // Sum across BlockK accumulators
-        auto& acc_n = accs[n * BlockK];
+        float32x4_t& acc_n = accs[n * BlockK];
 #pragma unroll
         for (auto iK = 1u; iK < BlockK; ++iK) {
             acc_n = vaddq_f32(acc_n, accs[n * BlockK + iK]);
         }
-        auto sum = vaddvq_f32(acc_n);
-
-        // Handle remainder when dK is not a multiple of StrideK
-        for (auto k = kStop; k < dK; ++k) {
-            sum += to_float(a[k]) * to_float(b[n * dK + k]);
-        }
-        out[n] = to_bf16(sum);
+        out[n] = to_bf16(vaddvq_f32(acc_n));
     }
 }
 
-template <uint64_t BlockN = 8ull, uint64_t BlockK = 2ull>
+template <uint64_t BlockN = 8, uint64_t BlockK = 2>
 NOINLINE void mv(const bf16* __restrict__ a,  // [dK]
                  const bf16* __restrict__ b,  // [dN * dK]
                  const uint64_t dK,
                  const uint64_t dN,
                  bf16* __restrict__ out) {  // [dN]
-    const auto nStop = BlockN * (dN / BlockN);
+    if (dK % (8 * BlockK)) {
+        throw std::invalid_argument(std::format(
+            "kernels::mv error: dK ({}) must be a multiple of 8 * BlockK ({})", dK, 8 * BlockK));
+    }
+    const auto stopN = BlockN * (dN / BlockN);
 #pragma omp parallel for
-    for (auto n = 0ull; n < nStop; n += BlockN) {
+    for (auto n = 0ull; n < stopN; n += BlockN) {
         _mv_chunk<BlockN, BlockK>(a, &b[n * dK], dK, &out[n]);
     }
     // Handle remainder when dN is not a multiple of BlockN
-    for (auto n = nStop; n < dN; ++n) {
+    for (auto n = stopN; n < dN; ++n) {
         _mv_chunk<1, BlockK>(a, &b[n * dK], dK, &out[n]);
     }
 }
@@ -182,8 +185,7 @@ void _mv_lut_chunk(const bf16* __restrict__ a,
                    bf16* __restrict__ out) {
     static_assert(dG % (BlockK * 32) == 0, "dG must be multiple of BlockK * 32");
 
-    // Accumulators: BlockN rows x BlockK16 partial sums (unscaled within group)
-    // Plus BlockN scaled accumulators for final results
+    // Initialise scaled accumulators
     float32x4_t acc_scaled[BlockN];
 #pragma unroll
     for (auto n = 0u; n < BlockN; ++n) {
@@ -231,7 +233,6 @@ void _mv_lut_chunk(const bf16* __restrict__ a,
                 acc = vbfdotq_f32(acc, ai3, biu3);
             }
         }
-
         // Sum across BlockK accumulators and apply scale
 #pragma unroll
         for (auto n = 0u; n < BlockN; ++n) {
@@ -239,7 +240,6 @@ void _mv_lut_chunk(const bf16* __restrict__ a,
 #pragma unroll
             for (auto iK = 1u; iK < BlockK; ++iK) {
                 acc_n = vaddq_f32(acc_n, accs[n * BlockK + iK]);
-                accs[n * BlockK + iK] = vmovq_n_f32(0.0f);
             }
             auto scale = vcvt_f32_bf16(vld1_dup_bf16(&bs[n * (dK / dG) + g]));
             acc_scaled[n] = vmlaq_f32(acc_scaled[n], acc_n, scale);
@@ -261,8 +261,14 @@ NOINLINE void mv_lut(const bf16* __restrict__ a,     // [dK]
                      const uint64_t dK,
                      const uint64_t dN,
                      bf16* __restrict__ out) {  // [dN]
-    assert(dK % dG == 0);
-    assert(dG % 32 == 0);
+    if (dK % dG != 0) {
+        throw std::invalid_argument(
+            std::format("kernels::mv_lut error: dK ({}) must be a multiple of dG ({})", dK, dG));
+    }
+    if (dG % 32 != 0) {
+        throw std::invalid_argument(
+            std::format("kernels::mv_lut error: dG ({}) must be a multiple of 32", dG));
+    }
 
     // Load LUT into tables of low-bytes and high-bytes
     uint16x8_t lut0 = vreinterpretq_u16_bf16(vld1q_bf16(&lut[0]));
@@ -270,14 +276,14 @@ NOINLINE void mv_lut(const bf16* __restrict__ a,     // [dK]
     uint8x16_t lut_lo = vcombine_u8(vmovn_u16(lut0), vmovn_u16(lut1));
     uint8x16_t lut_hi = vcombine_u8(vshrn_n_u16(lut0, 8), vshrn_n_u16(lut1, 8));
 
-    const auto nStop = BlockN * (dN / BlockN);
+    const auto stopN = BlockN * (dN / BlockN);
 #pragma omp parallel for
-    for (auto n = 0ull; n < nStop; n += BlockN) {
+    for (auto n = 0ull; n < stopN; n += BlockN) {
         _mv_lut_chunk<dG, BlockN, BlockK>(a, &b[n * (dK / 2)], lut_lo, lut_hi, &bs[n * (dK / dG)],
                                           dK, &out[n]);
     }
     // Handle remainder when dN is not a multiple of BlockN
-    for (auto n = nStop; n < dN; ++n) {
+    for (auto n = stopN; n < dN; ++n) {
         _mv_lut_chunk<dG, 1, BlockK>(a, &b[n * (dK / 2)], lut_lo, lut_hi, &bs[n * (dK / dG)], dK,
                                      &out[n]);
     }
@@ -312,8 +318,6 @@ void _mvi8_chunk(const i8* __restrict__ a,
                  const bf16* __restrict__ bs,
                  const uint64_t dK,
                  bf16* __restrict__ out) {
-    constexpr auto StrideK = BlockK * 16;
-
     // Accumulators: BlockN rows x BlockK partial sums
     int32x4_t accs[BlockN * BlockK];
 #pragma unroll
@@ -322,8 +326,7 @@ void _mvi8_chunk(const i8* __restrict__ a,
     }
 
     // Main loop, process [BlockN, BlockK * 16] elements of `b` per iteration
-    const auto kStop = (dK / StrideK) * StrideK;
-    for (auto k0 = 0u; k0 < kStop; k0 += StrideK) {
+    for (auto k0 = 0u; k0 < dK; k0 += BlockK * 16) {
 #pragma unroll
         for (auto iK = 0u; iK < BlockK; ++iK) {
             const auto k = k0 + iK * 16;
@@ -346,19 +349,12 @@ void _mvi8_chunk(const i8* __restrict__ a,
         for (auto iK = 1u; iK < BlockK; ++iK) {
             acc_n = vaddq_s32(acc_n, accs[n * BlockK + iK]);
         }
-        int32_t sum = vaddvq_s32(acc_n);
-
-        // Handle remainder when dK is not a multiple of StrideK
-        for (auto k = kStop; k < dK; ++k) {
-            sum += int32_t(a[k]) * int32_t(b[n * dK + k]);
-        }
-
         // Store
-        out[n] = to_bf16(float(sum) * a_scale * to_float(bs[n]));
+        out[n] = to_bf16(float(vaddvq_s32(acc_n)) * a_scale * to_float(bs[n]));
     }
 }
 
-template <uint64_t BlockN = 8ull, uint64_t BlockK = 2ull>
+template <uint64_t BlockN = 8, uint64_t BlockK = 2>
 NOINLINE void mvi8(const i8* __restrict__ a,     // [dK]
                    const i8* __restrict__ b,     // [dN * dK]
                    const bf16* __restrict__ as,  // [1]
@@ -366,13 +362,19 @@ NOINLINE void mvi8(const i8* __restrict__ a,     // [dK]
                    const uint64_t dK,
                    const uint64_t dN,
                    bf16* __restrict__ out) {  // [dN]
+    if (dK % (16 * BlockK)) {
+        throw std::invalid_argument(
+            std::format("kernels::mvi8 error: dK ({}) must be a multiple of 16 * BlockK ({})", dK,
+                        16 * BlockK));
+    }
+
     const auto a_scale = to_float(as[0]);
-    const auto nStop = BlockN * (dN / BlockN);
+    const auto stopN = BlockN * (dN / BlockN);
 #pragma omp parallel for
-    for (auto n = 0ull; n < nStop; n += BlockN) {
+    for (auto n = 0ull; n < stopN; n += BlockN) {
         _mvi8_chunk<BlockN, BlockK>(a, &b[n * dK], a_scale, &bs[n], dK, &out[n]);
     }
-    for (auto n = nStop; n < dN; ++n) {
+    for (auto n = stopN; n < dN; ++n) {
         _mvi8_chunk<1, BlockK>(a, &b[n * dK], a_scale, &bs[n], dK, &out[n]);
     }
 }
@@ -380,20 +382,15 @@ NOINLINE void mvi8(const i8* __restrict__ a,     // [dK]
 // ----------------------------------------------------------------------------
 // mvi8_lut3
 
-// b is packed with 3 values per byte
-// - each of the 3 values correspond to different rows (along dN)
-// - each byte is a 5-bit index into lut, then a 3-bit sign vector for the 3 values
 template <uint64_t BlockN, uint64_t BlockK>
 void _mvi8_lut3_chunk(const i8* __restrict__ a,
                       const uint8_t* __restrict__ b,
-                      const int8x16x4_t* __restrict__ lut_tables,
-                      const i8* __restrict__ lut,
+                      const int8x16x4_t* __restrict__ luts,
                       const float a_scale,
                       const bf16* __restrict__ bs,
                       const uint64_t dK,
                       bf16* __restrict__ out) {
     constexpr auto RowsPerPack = 3u;
-    constexpr auto StrideK = BlockK * 16;
 
     int32x4_t accs[BlockN * RowsPerPack * BlockK];
 #pragma unroll
@@ -401,8 +398,7 @@ void _mvi8_lut3_chunk(const i8* __restrict__ a,
         accs[i] = vdupq_n_s32(0);
     }
 
-    const auto k_stop = (dK / StrideK) * StrideK;
-    for (auto k0 = 0u; k0 < k_stop; k0 += StrideK) {
+    for (auto k0 = 0u; k0 < dK; k0 += BlockK * 16) {
 #pragma unroll
         for (auto iK = 0u; iK < BlockK; ++iK) {
             const auto k = k0 + iK * 16;
@@ -415,55 +411,34 @@ void _mvi8_lut3_chunk(const i8* __restrict__ a,
                 uint8x16_t idx2 = veorq_u8(idx0, vshrq_n_u8(packed, 7));
                 {  // row=0
                     int32x4_t& acc = accs[(n * RowsPerPack + 0) * BlockK + iK];
-                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(lut_tables[0], idx0));
+                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(luts[0], idx0));
                 }
                 {  // row=1
                     int32x4_t& acc = accs[(n * RowsPerPack + 1) * BlockK + iK];
-                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(lut_tables[1], idx1));
+                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(luts[1], idx1));
                 }
                 {  // row=2
                     int32x4_t& acc = accs[(n * RowsPerPack + 2) * BlockK + iK];
-                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(lut_tables[2], idx2));
+                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(luts[2], idx2));
                 }
             }
         }
     }
 
 #pragma unroll
-    for (auto iN = 0u; iN < BlockN; ++iN) {
+    for (auto n = 0u; n < BlockN * RowsPerPack; ++n) {
+        // Sum across BlockK accumulators
+        int32x4_t& acc_n = accs[n * BlockK];
 #pragma unroll
-        for (auto row = 0u; row < RowsPerPack; ++row) {
-            const auto n = iN * RowsPerPack + row;
-
-            // Sum across BlockK accumulators for this row
-            int32x4_t& acc_n = accs[(iN * RowsPerPack + row) * BlockK];
-#pragma unroll
-            for (auto iK = 1u; iK < BlockK; ++iK) {
-                acc_n = vaddq_s32(acc_n, accs[(iN * RowsPerPack + row) * BlockK + iK]);
-            }
-            int32_t sum = vaddvq_s32(acc_n);
-
-            // Handle remainder when dK is not a multiple of StrideK
-            for (auto k = k_stop; k < dK; ++k) {
-                uint8_t packed = b[iN * dK + k];
-                uint8_t idx;
-                if (row == 0) {
-                    idx = packed & 0x3F;
-                } else if (row == 1) {
-                    idx = (packed >> 1) & 0x3F;
-                } else {
-                    idx = (packed >> 7) ^ (packed & 0x3F);
-                }
-                sum += int32_t(a[k]) * lut[row * 64 + idx];
-            }
-
-            // Store
-            out[n] = to_bf16(float(sum) * a_scale * to_float(bs[n]));
+        for (auto iK = 1u; iK < BlockK; ++iK) {
+            acc_n = vaddq_s32(acc_n, accs[n * BlockK + iK]);
         }
+        // Store
+        out[n] = to_bf16(float(vaddvq_s32(acc_n)) * a_scale * to_float(bs[n]));
     }
 }
 
-template <uint64_t BlockN = 1ull, uint64_t BlockK = 2ull>
+template <uint64_t BlockN = 1, uint64_t BlockK = 2>
 NOINLINE void mvi8_lut3(const i8* __restrict__ a,       // [dK]
                         const uint8_t* __restrict__ b,  // packed tensor [(dN / 3) * dK]
                         const i8* __restrict__ lut,     // [3 * 64]
@@ -472,26 +447,34 @@ NOINLINE void mvi8_lut3(const i8* __restrict__ a,       // [dK]
                         const uint64_t dK,
                         const uint64_t dN,         // padded to multiple of 3
                         bf16* __restrict__ out) {  // [dN]
+    if (dK % (16 * BlockK)) {
+        throw std::invalid_argument(
+            std::format("kernels::mvi8_lut3 error: dK ({}) must be a multiple of 16 * BlockK ({})",
+                        dK, 16 * BlockK));
+    }
+    if (dN % 3 != 0) {
+        throw std::invalid_argument(
+            std::format("kernels::mvi8_lut3 error: dN ({}) must be a multiple of 3", dN));
+    }
     constexpr auto RowsPerPack = 3ull;
-    constexpr auto BlockRows = RowsPerPack * BlockN;
-    const auto a_scale = to_float(as[0]);
 
-    const std::array<int8x16x4_t, RowsPerPack> lut_tables = {
+    const auto a_scale = to_float(as[0]);
+    const std::array<int8x16x4_t, RowsPerPack> luts = {
         int8x16x4_t{vld1q_s8(&lut[0]), vld1q_s8(&lut[16]), vld1q_s8(&lut[32]), vld1q_s8(&lut[48])},
         int8x16x4_t{vld1q_s8(&lut[64]), vld1q_s8(&lut[80]), vld1q_s8(&lut[96]),
                     vld1q_s8(&lut[112])},
         int8x16x4_t{vld1q_s8(&lut[128]), vld1q_s8(&lut[144]), vld1q_s8(&lut[160]),
                     vld1q_s8(&lut[176])},
     };
-    const auto n_stop = BlockRows * (dN / BlockRows);
+    const auto stopN = (dN / (BlockN * RowsPerPack)) * BlockN * RowsPerPack;
 #pragma omp parallel for
-    for (auto n = 0ull; n < n_stop; n += BlockRows) {
-        _mvi8_lut3_chunk<BlockN, BlockK>(a, &b[(n / RowsPerPack) * dK], lut_tables.data(), lut,
-                                         a_scale, &bs[n], dK, &out[n]);
+    for (auto n = 0ull; n < stopN; n += BlockN * RowsPerPack) {
+        _mvi8_lut3_chunk<BlockN, BlockK>(a, &b[(n / RowsPerPack) * dK], luts.data(), a_scale,
+                                         &bs[n], dK, &out[n]);
     }
-    for (auto n = n_stop; n < dN; n += RowsPerPack) {
-        _mvi8_lut3_chunk<1, BlockK>(a, &b[(n / RowsPerPack) * dK], lut_tables.data(), lut, a_scale,
-                                    &bs[n], dK, &out[n]);
+    for (auto n = stopN; n < dN; n += RowsPerPack) {
+        _mvi8_lut3_chunk<1, BlockK>(a, &b[(n / RowsPerPack) * dK], luts.data(), a_scale, &bs[n], dK,
+                                    &out[n]);
     }
 }
 
@@ -501,14 +484,12 @@ NOINLINE void mvi8_lut3(const i8* __restrict__ a,       // [dK]
 template <uint64_t BlockN, uint64_t BlockK>
 void _mvi8_lut2_chunk(const i8* __restrict__ a,
                       const uint8_t* __restrict__ b,
-                      const int8x16x4_t* __restrict__ lut_tables,
-                      const i8* __restrict__ lut,
+                      const int8x16x4_t* __restrict__ luts,
                       const float a_scale,
                       const bf16* __restrict__ bs,
                       const uint64_t dK,
                       bf16* __restrict__ out) {
     constexpr auto RowsPerPack = 8u;
-    constexpr auto StrideK = BlockK * 16;
 
     int32x4_t accs[BlockN * RowsPerPack * BlockK];
 #pragma unroll
@@ -516,8 +497,7 @@ void _mvi8_lut2_chunk(const i8* __restrict__ a,
         accs[i] = vdupq_n_s32(0);
     }
 
-    const auto k_stop = (dK / StrideK) * StrideK;
-    for (auto k0 = 0u; k0 < k_stop; k0 += StrideK) {
+    for (auto k0 = 0u; k0 < dK; k0 += BlockK * 16) {
 #pragma unroll
         for (auto iK = 0u; iK < BlockK; ++iK) {
             const auto k = k0 + iK * 16;
@@ -538,52 +518,26 @@ void _mvi8_lut2_chunk(const i8* __restrict__ a,
 #pragma unroll
                 for (auto jN = 0u; jN < RowsPerPack; ++jN) {
                     int32x4_t& acc = accs[(iN * RowsPerPack + jN) * BlockK + iK];
-                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(lut_tables[jN % 2], idxs[jN / 2]));
+                    acc = vdotq_s32(acc, ai, vqtbl4q_s8(luts[jN % 2], idxs[jN / 2]));
                 }
             }
         }
     }
 
 #pragma unroll
-    for (auto iN = 0u; iN < BlockN; ++iN) {
+    for (auto n = 0u; n < BlockN * RowsPerPack; ++n) {
+        // Sum across BlockK accumulators for this row
+        int32x4_t& acc_n = accs[n * BlockK];
 #pragma unroll
-        for (auto row = 0u; row < RowsPerPack; ++row) {
-            const auto n = iN * RowsPerPack + row;
-
-            // Sum across BlockK accumulators for this row
-            int32x4_t& acc_n = accs[(iN * RowsPerPack + row) * BlockK];
-#pragma unroll
-            for (auto iK = 1u; iK < BlockK; ++iK) {
-                acc_n = vaddq_s32(acc_n, accs[(iN * RowsPerPack + row) * BlockK + iK]);
-            }
-            int32_t sum = vaddvq_s32(acc_n);
-
-            // Handle remainder when dK is not a multiple of StrideK
-            for (auto k = k_stop; k < dK; ++k) {
-                const auto b0 = b[iN * 3 * dK + 3 * k + 0];
-                const auto b1 = b[iN * 3 * dK + 3 * k + 1];
-                const auto b2 = b[iN * 3 * dK + 3 * k + 2];
-                const auto pair = row / 2;
-                uint8_t idx;
-                if (pair == 0) {
-                    idx = b0 & 0x3F;
-                } else if (pair == 1) {
-                    idx = uint8_t((b0 >> 6) | ((b1 & 0x0F) << 2));
-                } else if (pair == 2) {
-                    idx = uint8_t((b1 >> 4) | ((b2 & 0x03) << 4));
-                } else {
-                    idx = uint8_t(b2 >> 2);
-                }
-                sum += int32_t(a[k]) * int32_t(lut[(row % 2) * 64u + idx]);
-            }
-
-            // Store
-            out[n] = to_bf16(float(sum) * a_scale * to_float(bs[n]));
+        for (auto iK = 1u; iK < BlockK; ++iK) {
+            acc_n = vaddq_s32(acc_n, accs[n * BlockK + iK]);
         }
+        // Store
+        out[n] = to_bf16(float(vaddvq_s32(acc_n)) * a_scale * to_float(bs[n]));
     }
 }
 
-template <uint64_t BlockN = 1ull, uint64_t BlockK = 1ull>
+template <uint64_t BlockN = 1, uint64_t BlockK = 1>
 NOINLINE void mvi8_lut2(const i8* __restrict__ a,       // [dK]
                         const uint8_t* __restrict__ b,  // packed tensor [(dN / 8)*3 * dK]
                         const i8* __restrict__ lut,     // [2 * 64]
@@ -592,25 +546,32 @@ NOINLINE void mvi8_lut2(const i8* __restrict__ a,       // [dK]
                         const uint64_t dK,
                         const uint64_t dN,         // padded to multiple of 8
                         bf16* __restrict__ out) {  // [dN]
+    if (dK % (16 * BlockK)) {
+        throw std::invalid_argument(
+            std::format("kernels::mvi8_lut2 error: dK ({}) must be a multiple of 16 * BlockK ({})",
+                        dK, 16 * BlockK));
+    }
+    if (dN % 8 != 0) {
+        throw std::invalid_argument(
+            std::format("kernels::mvi8_lut2 error: dN ({}) must be a multiple of 8", dN));
+    }
     constexpr auto RowsPerPack = 8ull;
-    constexpr auto BlockRows = RowsPerPack * BlockN;
-    const auto a_scale = to_float(as[0]);
 
-    const std::array<int8x16x4_t, 2> lut_tables = {
+    const auto a_scale = to_float(as[0]);
+    const std::array<int8x16x4_t, 2> luts = {
         int8x16x4_t{vld1q_s8(&lut[0]), vld1q_s8(&lut[16]), vld1q_s8(&lut[32]), vld1q_s8(&lut[48])},
         int8x16x4_t{vld1q_s8(&lut[64]), vld1q_s8(&lut[80]), vld1q_s8(&lut[96]),
                     vld1q_s8(&lut[112])},
     };
-
-    const auto n_stop = BlockRows * (dN / BlockRows);
+    const auto stopN = (dN / (BlockN * RowsPerPack)) * BlockN * RowsPerPack;
 #pragma omp parallel for
-    for (auto n = 0ull; n < n_stop; n += BlockRows) {
-        _mvi8_lut2_chunk<BlockN, BlockK>(a, &b[(n / RowsPerPack) * 3ull * dK], lut_tables.data(),
-                                         lut, a_scale, &bs[n], dK, &out[n]);
+    for (auto n = 0ull; n < stopN; n += BlockN * RowsPerPack) {
+        _mvi8_lut2_chunk<BlockN, BlockK>(a, &b[(n / RowsPerPack) * 3ull * dK], luts.data(), a_scale,
+                                         &bs[n], dK, &out[n]);
     }
-    for (auto n = n_stop; n < dN; n += RowsPerPack) {
-        _mvi8_lut2_chunk<1, BlockK>(a, &b[(n / RowsPerPack) * 3ull * dK], lut_tables.data(), lut,
-                                    a_scale, &bs[n], dK, &out[n]);
+    for (auto n = stopN; n < dN; n += RowsPerPack) {
+        _mvi8_lut2_chunk<1, BlockK>(a, &b[(n / RowsPerPack) * 3ull * dK], luts.data(), a_scale,
+                                    &bs[n], dK, &out[n]);
     }
 }
 
@@ -694,8 +655,7 @@ void test_kernel_mv() {
     std::vector<std::tuple<uint64_t, uint64_t>> sizes = {
         // dK, dN
         {128, 64},
-        {120, 200},
-        {203, 101},
+        {64, 201},
     };
     for (auto [dK, dN] : sizes) {
         std::default_random_engine rng(100);
@@ -1117,7 +1077,7 @@ void benchmark_mvi8_lut3() {
         auto s = measure_time(reps, [&](uint64_t i) {
             auto idx = i % copies;
             kernels::mvi8_lut3(&a[idx * dK], &b[idx * dN_pad * dK], lut.data(), &as[idx],
-                               &bs[idx * dN_pad], dK, dN, &out[idx * dN_pad]);
+                               &bs[idx * dN_pad], dK, dN_pad, &out[idx * dN_pad]);
         });
         double bytes = double(dK * sizeof(i8) + (dN_pad / 3) * dK * sizeof(uint8_t) +
                               dN * sizeof(bf16) + dN * sizeof(bf16));
