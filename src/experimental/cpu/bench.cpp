@@ -478,6 +478,21 @@ NOINLINE void mvi8_lut3(const i8* __restrict__ a,       // [dK]
     }
 }
 
+NOINLINE void coo_scatter(const i8* __restrict__ a,          // [dK]
+                          const bf16* __restrict__ as,       // [1]
+                          const bf16* __restrict__ bv,       // [dS]
+                          const uint32_t* __restrict__ bik,  // [dS]
+                          const uint32_t* __restrict__ bin,  // [dS]
+                          const uint64_t dS,
+                          bf16* __restrict__ out) {  // [dN]
+    float a_scale = to_float(as[0]);
+    for (auto s = 0u; s < dS; ++s) {
+        auto k = bik[s];
+        auto n = bin[s];
+        out[n] = to_bf16(to_float(out[n]) + float(a[k]) * to_float(bv[s]) * a_scale);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // mvi8_lut2
 
@@ -890,6 +905,50 @@ struct TimingStats {
     double avg_time_stderr;
 };
 
+struct CooEntry {
+    uint32_t bin;
+    uint32_t bik;
+    bf16 value;
+};
+
+void fill_sorted_coo_entries(std::vector<bf16>& bv,
+                             std::vector<uint32_t>& bik,
+                             std::vector<uint32_t>& bin,
+                             const uint64_t dS,
+                             const uint64_t dK,
+                             const uint64_t dN,
+                             std::default_random_engine& rng) {
+    assert(bv.size() == dS);
+    assert(bik.size() == dS);
+    assert(bin.size() == dS);
+
+    std::uniform_int_distribution<uint32_t> bik_dist(0u, static_cast<uint32_t>(dK - 1));
+    std::uniform_int_distribution<uint32_t> bin_dist(0u, static_cast<uint32_t>(dN - 1));
+    std::uniform_real_distribution<float> value_dist(-0.5f, 0.5f);
+
+    std::vector<CooEntry> entries(dS);
+    for (auto s = 0ull; s < dS; ++s) {
+        entries[s] = {
+            .bin = bin_dist(rng),
+            .bik = bik_dist(rng),
+            .value = to_bf16(value_dist(rng)),
+        };
+    }
+
+    std::sort(entries.begin(), entries.end(), [](const CooEntry& lhs, const CooEntry& rhs) {
+        if (lhs.bin != rhs.bin) {
+            return lhs.bin < rhs.bin;
+        }
+        return lhs.bik < rhs.bik;
+    });
+
+    for (auto s = 0ull; s < dS; ++s) {
+        bv[s] = entries[s].value;
+        bik[s] = entries[s].bik;
+        bin[s] = entries[s].bin;
+    }
+}
+
 TimingStats measure_time(uint64_t reps, const std::function<void(uint64_t)>& fn) {
     // Warmup
     for (auto i = 0ull; i < reps; i++) {
@@ -1088,6 +1147,73 @@ void benchmark_mvi8_lut3() {
     std::cerr << "\n";
 }
 
+void benchmark_mvi8_lut3_coo_scatter() {
+    std::cerr << "### benchmark_mvi8_lut3_coo_scatter\n";
+
+    const std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> sizes = {
+        {4096, 4096, 0},
+        {4096, 4096, 128},
+        {4096, 4096, 512},
+        {4096, 4096, 4096},
+    };
+    const uint64_t reps = 16;
+
+    for (const auto& size : sizes) {
+        auto dK = std::get<0>(size), dN = std::get<1>(size), dS = std::get<2>(size);
+        const auto dN_pad = ((dN + 2) / 3) * 3;
+
+        const auto bytes_per_copy = (dN_pad / 3) * dK * sizeof(uint8_t) +
+                                    dS * (sizeof(bf16) + sizeof(uint32_t) + sizeof(uint32_t));
+        auto copies = std::max<uint64_t>(1, (1ull << 30) / bytes_per_copy);
+        std::vector<i8> a(copies * dK, i8(64));
+        std::vector<uint8_t> b(copies * dN_pad * dK, uint8_t(0));
+        std::vector<i8> lut(3 * 64, i8(0));
+        std::vector<bf16> as(copies, bf16(0.5f / 64.0f));
+        std::vector<bf16> bs(copies * dN_pad, bf16(0.5f / 64.0f));
+        std::vector<bf16> out(copies * dN_pad);
+        std::vector<bf16> bv(copies * dS);
+        std::vector<uint32_t> bik(copies * dS);
+        std::vector<uint32_t> bin(copies * dS);
+
+        for (auto i = 0u; i < 64u; ++i) {
+            lut[0 * 64 + i] = static_cast<i8>((int(i) % 15) - 7);
+            lut[1 * 64 + i] = static_cast<i8>(((int(i) + 5) % 15) - 7);
+            lut[2 * 64 + i] = static_cast<i8>(((int(i) + 10) % 15) - 7);
+        }
+        for (auto idx = 0ull; idx < b.size(); ++idx) {
+            const auto lut_index = uint8_t(idx % 32ull);
+            const auto sign_bits = uint8_t(((idx / 32ull) % 8ull) << 5);
+            b[idx] = uint8_t((sign_bits & 0x01) | lut_index | ((sign_bits & 0x02) << 5) |
+                             ((sign_bits & 0x04) << 5));
+        }
+
+        std::default_random_engine rng(300);
+        for (auto copy = 0ull; copy < copies; ++copy) {
+            std::vector<bf16> bv_view(dS);
+            std::vector<uint32_t> bik_view(dS), bin_view(dS);
+            fill_sorted_coo_entries(bv_view, bik_view, bin_view, dS, dK, dN, rng);
+            std::copy(bv_view.begin(), bv_view.end(), &bv[copy * dS]);
+            std::copy(bik_view.begin(), bik_view.end(), &bik[copy * dS]);
+            std::copy(bin_view.begin(), bin_view.end(), &bin[copy * dS]);
+        }
+
+        auto s = measure_time(reps, [&](uint64_t i) {
+            auto idx = i % copies;
+            kernels::mvi8_lut3(&a[idx * dK], &b[idx * dN_pad * dK], lut.data(), &as[idx],
+                               &bs[idx * dN_pad], dK, dN_pad, &out[idx * dN_pad]);
+            kernels::coo_scatter(&a[idx * dK], &as[idx], &bv[idx * dS], &bik[idx * dS],
+                                 &bin[idx * dS], dS, &out[idx * dN_pad]);
+        });
+        double bytes = double(dK * sizeof(i8) + (dN_pad / 3) * dK * sizeof(uint8_t) +
+                              dS * (sizeof(bf16) + sizeof(uint32_t) + sizeof(uint32_t)) +
+                              dN_pad * sizeof(bf16) + dN_pad * sizeof(bf16));
+        double gbs = bytes / (s.avg_time * 1e9);
+        std::cerr << std::format("{:<25} {:>8.3f} ms {:>8.1f} GB/s\n",
+                                 std::format("{} x {} + {}", dK, dN, dS), s.avg_time * 1e3, gbs);
+    }
+    std::cerr << "\n";
+}
+
 void benchmark_mvi8_lut2() {
     std::cerr << "### benchmark_mvi8_lut2\n";
 
@@ -1162,6 +1288,7 @@ int main() {
     benchmarks::benchmark_mv_lut();
     benchmarks::benchmark_mvi8();
     benchmarks::benchmark_mvi8_lut3();
+    benchmarks::benchmark_mvi8_lut3_coo_scatter();
     benchmarks::benchmark_mvi8_lut2();
 
     return 0;
