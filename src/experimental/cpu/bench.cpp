@@ -548,7 +548,14 @@ static inline svfloat32_t load_dup_bf16_as_f32(const bf16* p) {
     return svreinterpret_f32_u32(svlsl_n_u32_x(svptrue_b32(), svunpklo_u32(v16), 16));
 }
 
-template <uint64_t dG>
+// Use the same block size for packing and decoding, without crossing scale groups.
+inline uint64_t sve_nibble_block(uint64_t dG) {
+    return std::gcd(dG, 2 * svcntb());
+}
+
+// A proper divisor of 2 * svcntb() is at most svcntb(), so the partial path only
+// needs zip1 and one activation vector per nibble half.
+template <uint64_t dG, bool Full>
 void _mv_lut_chunk_sve_N1(const bf16* __restrict__ a,
                           const uint8_t* __restrict__ b,
                           const svuint8_t lut_lo,
@@ -556,9 +563,12 @@ void _mv_lut_chunk_sve_N1(const bf16* __restrict__ a,
                           const bf16* __restrict__ bs,
                           const uint64_t dK,
                           bf16* __restrict__ out) {
-    const uint64_t VLb = svcntb();   // bytes / vector
-    const uint64_t VLh = VLb / 2;    // bf16 lanes / vector
-    const uint64_t KStep = 2 * VLb;  // elements per iter
+    const uint64_t VLb = svcntb();                                // bytes / vector
+    const uint64_t VLh = VLb / 2;                                 // bf16 lanes / vector
+    const uint64_t KStep = Full ? 2 * VLb : sve_nibble_block(dG);  // elements per iter
+    const uint64_t KHalf = KStep / 2;                             // elements per nibble half
+    const svbool_t pB = Full ? svptrue_b8() : svwhilelt_b8(uint64_t(0), KHalf);
+    const svbool_t pA = Full ? svptrue_b16() : svwhilelt_b16(uint64_t(0), KHalf);
 
     svfloat32_t acc_scaled0 = svdup_f32(0.0f);
     const uint64_t nG = dK / dG;
@@ -566,37 +576,43 @@ void _mv_lut_chunk_sve_N1(const bf16* __restrict__ a,
         svfloat32_t acc0 = svdup_f32(0.0f);
         for (auto iK = 0ull; iK < dG / KStep; ++iK) {
             auto k = g * dG + iK * KStep;
-            const svbfloat16_t a0 = svld1_bf16(svptrue_b16(), &a[k + 0 * VLh]);
-            const svbfloat16_t a1 = svld1_bf16(svptrue_b16(), &a[k + 1 * VLh]);
-            const svbfloat16_t a2 = svld1_bf16(svptrue_b16(), &a[k + 2 * VLh]);
-            const svbfloat16_t a3 = svld1_bf16(svptrue_b16(), &a[k + 3 * VLh]);
+            const svbfloat16_t a0 = svld1_bf16(pA, &a[k]);
+            const svbfloat16_t a2 = svld1_bf16(pA, &a[k + KHalf]);
 
             // Load packed 4-bit indices
-            const svuint8_t biq = svld1_u8(svptrue_b8(), &b[k / 2]);
-            const svuint8_t idx0 = svand_n_u8_z(svptrue_b8(), biq, 0x0F);  // k .. k+VLb-1
-            const svuint8_t idx1 = svlsr_n_u8_z(svptrue_b8(), biq, 4);     // k+VLb .. k+2*VLb-1
+            const svuint8_t biq = svld1_u8(pB, &b[k / 2]);
+            const svuint8_t idx0 = svand_n_u8_z(svptrue_b8(), biq, 0x0F);  // k .. k+KHalf-1
+            const svuint8_t idx1 = svlsr_n_u8_z(svptrue_b8(), biq, 4);     // k+KHalf .. k+KStep-1
 
             // Decode idx0
             const svuint8_t t0_lo = svtbl_u8(lut_lo, idx0);
             const svuint8_t t0_hi = svtbl_u8(lut_hi, idx0);
             const svbfloat16_t b0 =
                 svreinterpret_bf16_u16(svreinterpret_u16_u8(svzip1_u8(t0_lo, t0_hi)));
-            const svbfloat16_t b1 =
-                svreinterpret_bf16_u16(svreinterpret_u16_u8(svzip2_u8(t0_lo, t0_hi)));
 
             // Decode idx1
             const svuint8_t t1_lo = svtbl_u8(lut_lo, idx1);
             const svuint8_t t1_hi = svtbl_u8(lut_hi, idx1);
             const svbfloat16_t b2 =
                 svreinterpret_bf16_u16(svreinterpret_u16_u8(svzip1_u8(t1_lo, t1_hi)));
-            const svbfloat16_t b3 =
-                svreinterpret_bf16_u16(svreinterpret_u16_u8(svzip2_u8(t1_lo, t1_hi)));
 
             // Accumulate
-            acc0 = svbfdot(acc0, a0, b0);
-            acc0 = svbfdot(acc0, a1, b1);
-            acc0 = svbfdot(acc0, a2, b2);
-            acc0 = svbfdot(acc0, a3, b3);
+            if constexpr (Full) {
+                const svbfloat16_t a1 = svld1_bf16(svptrue_b16(), &a[k + 1 * VLh]);
+                const svbfloat16_t a3 = svld1_bf16(svptrue_b16(), &a[k + 3 * VLh]);
+                const svbfloat16_t b1 =
+                    svreinterpret_bf16_u16(svreinterpret_u16_u8(svzip2_u8(t0_lo, t0_hi)));
+                const svbfloat16_t b3 =
+                    svreinterpret_bf16_u16(svreinterpret_u16_u8(svzip2_u8(t1_lo, t1_hi)));
+                acc0 = svbfdot(acc0, a0, b0);
+                acc0 = svbfdot(acc0, a1, b1);
+                acc0 = svbfdot(acc0, a2, b2);
+                acc0 = svbfdot(acc0, a3, b3);
+            } else {
+                // zip1 contains all KHalf active elements.
+                acc0 = svbfdot(acc0, a0, b0);
+                acc0 = svbfdot(acc0, a2, b2);
+            }
         }
         svfloat32_t scale = load_dup_bf16_as_f32(&bs[g]);
         acc_scaled0 = svmla_f32_x(svptrue_b32(), acc_scaled0, acc0, scale);
@@ -612,7 +628,8 @@ NOINLINE void mv_lut_sve(const bf16* __restrict__ a,
                          const uint64_t dK,
                          const uint64_t dN,
                          bf16* __restrict__ out) {
-    assert((dG % (2 * svcntb()) == 0) && "dG must be multiple of (SVE vector length / 4 bits)");
+    static_assert(dG > 0 && dG % 32 == 0, "dG must be a positive multiple of 32");
+    assert(dK % dG == 0);
 
     uint16x8_t lut0 = vreinterpretq_u16_bf16(vld1q_bf16(&lut[0]));
     uint16x8_t lut1 = vreinterpretq_u16_bf16(vld1q_bf16(&lut[8]));
@@ -621,10 +638,18 @@ NOINLINE void mv_lut_sve(const bf16* __restrict__ a,
     svuint8_t lut_lo = svld1rq_u8(svptrue_b8(), reinterpret_cast<const uint8_t*>(&lut_lo_neon));
     svuint8_t lut_hi = svld1rq_u8(svptrue_b8(), reinterpret_cast<const uint8_t*>(&lut_hi_neon));
 
+    if (sve_nibble_block(dG) == 2 * svcntb()) {
 #pragma omp parallel for
-    for (uint64_t n = 0; n < dN; ++n) {
-        _mv_lut_chunk_sve_N1<dG>(a, b + n * (dK / 2), lut_lo, lut_hi, bs + n * (dK / dG), dK,
-                                 out + n);
+        for (uint64_t n = 0; n < dN; ++n) {
+            _mv_lut_chunk_sve_N1<dG, true>(a, b + n * (dK / 2), lut_lo, lut_hi,
+                                       bs + n * (dK / dG), dK, out + n);
+        }
+    } else {
+#pragma omp parallel for
+        for (uint64_t n = 0; n < dN; ++n) {
+            _mv_lut_chunk_sve_N1<dG, false>(a, b + n * (dK / 2), lut_lo, lut_hi,
+                                        bs + n * (dK / dG), dK, out + n);
+        }
     }
 }
 
@@ -895,7 +920,7 @@ void test_block_quantise() {
                               actual4.data());
 
     std::vector<bf16> actual_sve(dN);
-    auto bq_sve_data = bq.permute_for_block_nibbles(svcntb() * 2);
+    auto bq_sve_data = bq.permute_for_block_nibbles(kernels::sve_nibble_block(dG));
     kernels::mv_lut_sve<dG>(a.data(), bq_sve_data.data(), bq.lut.data(), bq.scale.data(), dK, dN,
                             actual_sve.data());
 
@@ -905,10 +930,61 @@ void test_block_quantise() {
     EXPECT_CLOSE(ref, actual_sve, 0.001);
 }
 
+template <uint64_t dG>
+void test_mv_lut_sve_group_size() {
+    constexpr uint64_t dN = 3;
+    for (uint64_t nG : {1, 3}) {
+        const auto dK = nG * dG;
+        std::vector<bf16> a(dK);
+        ScaledTensor bq{.data = std::vector<uint8_t>(dN * dK / 2),
+                        .scale = std::vector<bf16>(dN * nG),
+                        .lut = std::vector<bf16>(16),
+                        .block_size = dG,
+                        .bits_per_element = 4};
+
+        // Exactly representable inputs keep this independent of random distributions
+        // and floating-point reduction order. Both nibble halves and scales vary.
+        for (uint64_t k = 0; k < dK; ++k) {
+            a[k] = to_bf16(float(int(k % 7) - 3));
+        }
+        for (uint64_t i = 0; i < bq.data.size(); ++i) {
+            bq.data[i] = uint8_t((i % 16) | (((i * 7 + i / 16 + 3) % 16) << 4));
+        }
+        for (uint64_t g = 0; g < bq.scale.size(); ++g) {
+            bq.scale[g] = to_bf16(float(1u << (g % 4)) / 4.0f);
+        }
+        for (uint64_t i = 0; i < bq.lut.size(); ++i) {
+            bq.lut[i] = to_bf16(float(int(i) - 8) / 8.0f);
+        }
+
+        auto br = bq.dequantise();
+        std::vector<bf16> expected(dN), actual(dN);
+        kernels::mm_naive(a.data(), br.data(), 1, dK, dN, expected.data());
+        auto packed = bq.permute_for_block_nibbles(kernels::sve_nibble_block(dG));
+        kernels::mv_lut_sve<dG>(a.data(), packed.data(), bq.lut.data(), bq.scale.data(), dK, dN,
+                                actual.data());
+        for (uint64_t n = 0; n < dN; ++n) {
+            if (to_float(actual[n]) != to_float(expected[n])) {
+                throw std::runtime_error(std::format(
+                    "mv_lut_sve: dG={}, nG={}, n={}: {} != {}", dG, nG, n,
+                    to_float(actual[n]), to_float(expected[n])));
+            }
+        }
+    }
+}
+
+void test_mv_lut_sve() {
+    test_mv_lut_sve_group_size<32>();
+    test_mv_lut_sve_group_size<64>();
+    test_mv_lut_sve_group_size<96>();
+    test_mv_lut_sve_group_size<128>();
+    test_mv_lut_sve_group_size<256>();
+}
+
 void test_all() {
     std::cerr << "### Running tests\n\n";
     auto success = true;
-    for (auto test : {&test_kernel_mm, &test_block_quantise}) {
+    for (auto test : {&test_kernel_mm, &test_block_quantise, &test_mv_lut_sve}) {
         try {
             test();
         } catch (const std::exception& e) {
