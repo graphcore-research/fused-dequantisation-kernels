@@ -878,8 +878,18 @@ void test_block_quantise() {
     kernels::mv(a.data(), b.data(), dK, dN, original.data());
 
     auto bq = ScaledTensor::quantise_linear(b, dG, bits_per_element);
-    auto br = bq.dequantise();
-    kernels::mv(a.data(), br.data(), dK, dN, ref.data());
+    // Fused kernels apply each scale after accumulation, without rounding the
+    // scaled weights to bf16. Keep those weights unrounded in the reference.
+    for (uint64_t n = 0; n < dN; ++n) {
+        double sum = 0.0;
+        for (uint64_t k = 0; k < dK; ++k) {
+            auto byte = bq.data[(n * dK + k) / 2];
+            auto q = uint64_t((byte >> (4 * (k % 2))) & 0x0F);
+            sum += double(to_float(a[k])) * double(to_float(bq.lut[q])) *
+                   double(to_float(bq.scale[n * (dK / dG) + k / dG]));
+        }
+        ref[n] = to_bf16(float(sum));
+    }
 
     // std::cerr << "bq: " << std::hex << std::vector<int>(bq.data.begin(), bq.data.end()) << "\n\n"
     //           << std::dec;
@@ -905,10 +915,39 @@ void test_block_quantise() {
     EXPECT_CLOSE(ref, actual_sve, 0.001);
 }
 
-void test_all() {
+void test_lut_scale_precision() {
+    constexpr uint64_t dG = 32;
+    std::vector<bf16> a(dG, bf16(0.0f));
+    a[0] = bf16(1.0f);
+    a[1] = bf16(-1.0f);
+    ScaledTensor bq{.data = std::vector<uint8_t>(dG / 2),
+                    .scale = {bf16(1.0078125f)},
+                    .lut = std::vector<bf16>(16),
+                    .block_size = dG,
+                    .bits_per_element = 4};
+    bq.data[0] = 0x23;
+    bq.lut[2] = bf16(2.0f);
+    bq.lut[3] = bf16(3.0f);
+
+    // (3 - 2) * scale is exactly representable. Rounding the scaled weights
+    // first would instead give 1.015625.
+    std::vector<bf16> expected{bq.scale[0]}, actual(1);
+    auto lut8 = bq.lutN<2>();
+    kernels::mv_lut8(a.data(), reinterpret_cast<const uint32_t*>(bq.data.data()),
+                     reinterpret_cast<const uint32_t*>(lut8.data()), bq.scale.data(), dG, 1, dG,
+                     actual.data());
+    EXPECT_EQ(expected, actual, 0.0f);
+
+    auto packed = bq.permute_for_block_nibbles(32);
+    kernels::mv_lut<dG>(a.data(), packed.data(), bq.lut.data(), bq.scale.data(), dG, 1,
+                        actual.data());
+    EXPECT_EQ(expected, actual, 0.0f);
+}
+
+bool test_all() {
     std::cerr << "### Running tests\n\n";
     auto success = true;
-    for (auto test : {&test_kernel_mm, &test_block_quantise}) {
+    for (auto test : {&test_kernel_mm, &test_block_quantise, &test_lut_scale_precision}) {
         try {
             test();
         } catch (const std::exception& e) {
@@ -919,6 +958,7 @@ void test_all() {
     if (success) {
         std::cerr << "---> Tests passed\n\n" << std::flush;
     }
+    return success;
 }
 
 }  // namespace tests
@@ -1191,7 +1231,7 @@ int main() {
     std::cerr << std::format("# SVE vector length: {} bits\n", 8 * svcntb());
     std::cerr << "\n";
 
-    tests::test_all();
+    const auto tests_passed = tests::test_all();
 
     benchmarks::benchmark_memcpy();
     benchmarks::benchmark_reduce_sum();
@@ -1201,5 +1241,5 @@ int main() {
     benchmarks::benchmark_mv_lut_sve();
     benchmarks::benchmark_mm();
 
-    return 0;
+    return tests_passed ? 0 : 1;
 }
